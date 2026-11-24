@@ -62,6 +62,22 @@ jobs:
           curl -sSL -o uf2families.json https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2families.json
           python3 uf2conv.py -c -f 0xADA52840 -o build/node/GroundwellNode.uf2 build/node/GroundwellNode.ino.hex
 
+      - name: Check hub files against the hub's own upload checks
+        run: |
+          python3 - <<'PY'
+          def accepted(path):   # same test as handleUpdateUpload(): image magic, app descriptor, ESP32-C6 chip id
+              b = open(path, 'rb').read(48)
+              return b[0] == 0xE9 and b[32:36] == bytes([0x32, 0x54, 0xCD, 0xAB]) and (b[12] | b[13] << 8) == 0x000D
+          cases = [("build/hub/GroundwellHub.ino.bin", True),
+                   ("build/hub-crashtest/GroundwellHub-crashtest.bin", True),
+                   ("build/hub/GroundwellHub.ino.merged.bin", False),
+                   ("build/node/GroundwellNode.ino.hex", False)]
+          for path, want in cases:
+              got = accepted(path)
+              print(f"{path}: {'accepted' if got else 'refused'} ({'as expected' if got == want else 'UNEXPECTED'})")
+              assert got == want
+          PY
+
       - name: Size report
         run: |
           HUB=$(grep -oP 'Sketch uses \K[0-9]+' build/hub.log)
