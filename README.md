@@ -16,7 +16,7 @@ The cloud (Cloudflare Worker + D1, dashboard, health engine) lives in [groundwel
 
 **Node:** Arduino IDE, board package "Seeed nRF52 Boards" (not mbed), board "Seeed XIAO nRF52840", library "DHT sensor library" by Adafruit. Open `node/GroundwellNode` and upload. Then run factory calibration: `cd tools && python factory_cal.py --operator BN`.
 
-**Hub:** board package "esp32" **3.x** (not 4.0), board "XIAO_ESP32C6", any partition scheme (the sketch brings its own). Optionally copy `hub/GroundwellHub/secrets.example.h` to `secrets.h` and fill it in; without it the hub opens a setup hotspot. Upload, then set an update password at `http://plants.local/setup`.
+**Hub:** board package "esp32" **3.x** (not 4.0), board "XIAO_ESP32C6", partition scheme **Huge APP** (only for the IDE's size check; the sketch brings its own two-slot table). Optionally copy `hub/GroundwellHub/secrets.example.h` to `secrets.h` and fill it in; without it the hub opens a setup hotspot. Upload, then set an update password at `http://plants.local/setup`.
 
 **Without Arduino IDE:** every push builds both boards on GitHub (Actions > latest run > Artifacts): `.uf2` for the node, `.merged.bin` for the hub's web flasher, and the files for over-the-air updates.
 

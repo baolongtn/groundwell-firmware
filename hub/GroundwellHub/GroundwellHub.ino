@@ -1,9 +1,9 @@
 /*
   GROUNDWELL hub v0.9.1
   Board: Seeed XIAO ESP32-C6, Arduino core "esp32 by Espressif Systems" 3.x (NOT 4.x: it replaced the BLE API),
-         board "XIAO_ESP32C6". Any Partition Scheme: partitions.csv in this folder overrides it with two
-         1.875 MB app slots for over-the-air updates. (The IDE still prints the menu's size limit; the real
-         limit is 1,966,080 bytes, and the GitHub build checks it.)
+         board "XIAO_ESP32C6", Tools > Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)".
+         The menu only sets the IDE's size check: partitions.csv in this folder replaces the layout with two
+         1.875 MB app slots for over-the-air updates. The real limit is 1,966,080 bytes; the GitHub build checks it.
 
   Updates over the air (v0.9.1)
     - http://plants.local/update : upload GroundwellHub.ino.bin (user "admin", the update password).
@@ -55,6 +55,12 @@
 #include <time.h>
 #include "bthome.h"
 #include "page.h"
+
+// The IDE checks the sketch size against the Partition Scheme menu, and the other choices on this board
+// are too small (Default allows 1.25 MB). partitions.csv still sets the real layout.
+#if !defined(ARDUINO_PARTITION_huge_app) && !defined(ARDUINO_PARTITION_no_ota)
+  #error "Pick Tools > Partition Scheme > Huge APP (3MB No OTA/1MB SPIFFS). It only sets the size check; partitions.csv in this folder gives the hub its two update slots."
+#endif
 
 // ======================= settings =======================
 #ifndef GW_CRASH_TEST
