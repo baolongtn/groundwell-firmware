@@ -154,7 +154,7 @@ function update(d){
     const sc=s.fcal?100:1;
     [['.i-dry',s.dry/sc],['.i-wet',s.wet/sc],['.i-thr',s.thr]].forEach(([k,v])=>{const e=q(k);if(!open||e.value==='')e.value=v});
   });
-  st.innerHTML='<span class="dot"></span>Hub '+d.ip+' · Wi-Fi '+d.rssi+' dBm · up '+fmtUp(d.uptime);
+  st.innerHTML='<span class="dot"></span>Hub '+d.ip+' · Wi-Fi '+d.rssi+' dBm · up '+fmtUp(d.uptime)+' · firmware '+d.fw+(d.trial?' (on trial)':'')+'<span class="adm"> · <a href="/update">Update</a> · <a href="/setup">Settings</a></span>';
   const c=d.cloud;
   if(!c.enabled)cl.innerHTML='<span class="dot warn"></span>Cloud upload off';
   else if(c.ageS<0)cl.innerHTML='<span class="dot warn"></span>Cloud: waiting for first upload ('+c.queued+' queued, last HTTP '+c.code+')';

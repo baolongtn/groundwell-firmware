@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL sensor node v0.9.0  (two soil probes + air temperature/humidity + light + UV, one board)
+  GROUNDWELL sensor node v0.9.1  (two soil probes + air temperature/humidity + light + UV, one board)
   Board:  Seeed XIAO nRF52840 (plain or Sense)
           Arduino IDE: Boards Manager URL
             https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
@@ -8,6 +8,12 @@
           Library Manager: install "DHT sensor library" by Adafruit (accept its "Adafruit Unified Sensor" dependency).
           Only if you set LIGHT_SENSOR to LIGHT_I2C: also install "Adafruit VEML7700 Library"
           (accept its "Adafruit BusIO" dependency). The SHT4x, AHT20 and LTR390 need no library.
+
+  Updates over Bluetooth (v0.9.1)
+    For DFU_WINDOW_MS (10 min) after power-up or a reset, the node advertises continuously and accepts a
+    connection, so a phone can update it: nRF Connect for Mobile > connect to "GW" > DFU > pick the
+    GroundwellNode.ino.zip from the build. After the window it goes back to short non-connectable bursts,
+    so nobody can reflash it from the street. Press reset (once) to open the window again.
 
   What it does
     Every REPORT_MS (30 s) it reads both probes, air temperature/humidity and light, then broadcasts one
@@ -86,7 +92,7 @@
     corrode, and soil polarization cancels out.
 */
 
-static const char *FW_VERSION = "0.9.0";
+static const char *FW_VERSION = "0.9.1";
 
 // ---------------- light sensor choice ----------------
 #define LIGHT_LDR      1                         // GL5539 photoresistor + DHT11, no I2C (the parts in hand)
@@ -115,6 +121,7 @@ static const float    AIR_JUMP_RH     = 15.0f;
 static const float    AIR_CONFIRM_C   = 1.5f;  // ... are held until the next reading lands within this of them
 static const float    AIR_CONFIRM_RH  = 6.0f;
 static const int8_t   TX_POWER_DBM    = 4;     // 0 or 4; raise to 8 if the hub is far away
+static const uint32_t DFU_WINDOW_MS   = 10UL * 60 * 1000;   // Bluetooth updates accepted this long after a reset (0 = never)
 static const uint16_t CAP_SETTLE_MS   = 150;   // capacitive probe power-up settle
 static const uint8_t  OVERSAMPLE      = 16;
 #define DHT_TYPE DHT11                           // DHT22 if you upgrade the sensor
@@ -630,15 +637,26 @@ static uint8_t buildBTHome(uint8_t *b, uint8_t pid, bool airOk, float tempC, flo
   return n;                                          // 26 bytes with air + light + UV (the legacy advert's limit), 14 with none
 }
 
+BLEDfu bledfu;                                       // Bluetooth update service (hands over to the bootloader)
+BLEDis bledis;                                       // device information: shows the firmware version in nRF Connect
+
+static bool dfuWindowOpen() { return DFU_WINDOW_MS && millis() < DFU_WINDOW_MS; }
+
 static void advertise(const uint8_t *svc, uint8_t len) {
+  // In the update window (and not already connected), advertise continuously and accept a connection,
+  // with the name "GW" in the scan response. Otherwise: a non-connectable burst, then the radio sleeps.
+  bool connectable = dfuWindowOpen() && Bluefruit.connected() == 0;
   Bluefruit.Advertising.stop();
   Bluefruit.Advertising.clearData();
+  Bluefruit.ScanResponse.clearData();
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addData(BLE_GAP_AD_TYPE_SERVICE_DATA, svc, len);
-  Bluefruit.Advertising.setType(BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED);
+  if (connectable) Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.setType(connectable ? BLE_GAP_ADV_TYPE_CONNECTABLE_SCANNABLE_UNDIRECTED
+                                            : BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED);
   Bluefruit.Advertising.setInterval(ADV_INTERVAL_MS * 1000 / 625, ADV_INTERVAL_MS * 1000 / 625);
   Bluefruit.Advertising.restartOnDisconnect(false);
-  Bluefruit.Advertising.start(ADV_BURST_S);          // broadcast this reading for a few seconds, then the radio sleeps
+  Bluefruit.Advertising.start(connectable ? 0 : ADV_BURST_S);   // 0 = until the next reading replaces it
 }
 
 void setup() {
@@ -676,10 +694,16 @@ void setup() {
   Bluefruit.autoConnLed(false);
   Bluefruit.setTxPower(TX_POWER_DBM);
   Bluefruit.setName("GW");
+  bledfu.begin();
+  bledis.setManufacturer("GROUNDWELL");
+  bledis.setModel("Sensor node");
+  bledis.setSoftwareRev(FW_VERSION);                 // firmware revision stays the bootloader's (update apps read it)
+  bledis.begin();
 
   ble_gap_addr_t addr = Bluefruit.getAddr();
   Serial.printf("GROUNDWELL node fw %s  address %02X:%02X:%02X:%02X:%02X:%02X\n", FW_VERSION,
                 addr.addr[5], addr.addr[4], addr.addr[3], addr.addr[2], addr.addr[1], addr.addr[0]);
+  if (DFU_WINDOW_MS) Serial.printf("Bluetooth updates open for %lu min: nRF Connect > \"GW\" > DFU\n", (unsigned long)(DFU_WINDOW_MS / 60000));
   if (calOk) Serial.printf("Factory calibration: air %u, water %u (sending moisture %%)\n", cal.air, cal.water);
   else       Serial.println("No factory calibration yet (sending the raw capacitive count). Send CAL AIR, then CAL WATER.");
 }

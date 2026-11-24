@@ -36,12 +36,20 @@ jobs:
 
       - name: Build hub (XIAO ESP32-C6)
         run: |
-          # CI has no real credentials: build with the placeholder values.
+          # No secrets.h in CI: the hub opens its setup hotspot on first boot.
           mkdir -p build
-          cp hub/GroundwellHub/secrets.example.h hub/GroundwellHub/secrets.h
-          arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6:PartitionScheme=huge_app \
+          # partitions.csv in the sketch folder gives two 1,966,080-byte app slots; fail the build if the hub outgrows one.
+          arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6 --build-property upload.maximum_size=1966080 \
             --output-dir build/hub hub/GroundwellHub 2>&1 | tee build/hub.log
           test -f build/hub/GroundwellHub.ino.bin
+          grep -qa app1 build/hub/GroundwellHub.ino.partitions.bin   # the two-slot table made it into the build
+
+      - name: Build hub rollback test (crashes 20 s after boot)
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6 --build-property upload.maximum_size=1966080 \
+            --build-property "compiler.cpp.extra_flags=-DGW_CRASH_TEST=1" \
+            --output-dir build/hub-crashtest hub/GroundwellHub > build/hub-crashtest.log 2>&1 || { cat build/hub-crashtest.log; exit 1; }
+          mv build/hub-crashtest/GroundwellHub.ino.bin build/hub-crashtest/GroundwellHub-crashtest.bin
 
       - name: Build node (XIAO nRF52840)
         run: |
@@ -74,6 +82,7 @@ jobs:
           path: |
             build/hub/GroundwellHub.ino.bin
             build/hub/GroundwellHub.ino.merged.bin
+            build/hub-crashtest/GroundwellHub-crashtest.bin
             build/node/GroundwellNode.ino.hex
             build/node/GroundwellNode.ino.zip
             build/node/GroundwellNode.uf2
