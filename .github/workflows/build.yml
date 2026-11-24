@@ -1,0 +1,76 @@
+name: build
+
+# Compiles the hub and node firmware against the real board packages on every push.
+# Output: downloadable firmware files (Actions > this run > Artifacts) and a size report.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install board packages and libraries
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli config add board_manager.additional_urls https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+          arduino-cli core install Seeeduino:nrf52
+          arduino-cli lib install "DHT sensor library" "Adafruit Unified Sensor" "Adafruit VEML7700 Library"
+          arduino-cli core list
+          arduino-cli board listall Seeeduino:nrf52
+          pip install --quiet adafruit-nrfutil
+
+      - name: Build hub (XIAO ESP32-C6)
+        run: |
+          # CI has no real credentials: build with the placeholder values.
+          mkdir -p build
+          cp hub/GroundwellHub/secrets.example.h hub/GroundwellHub/secrets.h
+          arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6:PartitionScheme=huge_app \
+            --output-dir build/hub hub/GroundwellHub 2>&1 | tee build/hub.log
+          test -f build/hub/GroundwellHub.ino.bin
+
+      - name: Build node (XIAO nRF52840)
+        run: |
+          mkdir -p build
+          arduino-cli compile --fqbn Seeeduino:nrf52:xiaonRF52840 \
+            --output-dir build/node node/GroundwellNode 2>&1 | tee build/node.log
+          test -f build/node/GroundwellNode.ino.hex
+          # UF2 for drag-and-drop flashing: double-tap reset, copy the file onto the XIAO drive.
+          curl -sSL -o uf2conv.py https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2conv.py
+          curl -sSL -o uf2families.json https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2families.json
+          python3 uf2conv.py -c -f 0xADA52840 -o build/node/GroundwellNode.uf2 build/node/GroundwellNode.ino.hex
+
+      - name: Size report
+        run: |
+          HUB=$(grep -oP 'Sketch uses \K[0-9]+' build/hub.log)
+          NODE=$(grep -oP 'Sketch uses \K[0-9]+' build/node.log || echo "?")
+          OTA_SLOT=1966080   # app slot in "Minimal SPIFFS (1.9MB APP with OTA)"
+          {
+            echo "## Firmware size"
+            echo "| | Bytes | Note |"
+            echo "|---|---|---|"
+            echo "| Hub app | $HUB | OTA slot holds $OTA_SLOT: $(( HUB * 100 / OTA_SLOT ))% of it |"
+            echo "| Node app | $NODE | |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "HUB_BYTES=$HUB  NODE_BYTES=$NODE  HUB_PCT_OF_OTA_SLOT=$(( HUB * 100 / OTA_SLOT ))"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: groundwell-firmware-${{ github.sha }}
+          path: |
+            build/hub/GroundwellHub.ino.bin
+            build/hub/GroundwellHub.ino.merged.bin
+            build/node/GroundwellNode.ino.hex
+            build/node/GroundwellNode.ino.zip
+            build/node/GroundwellNode.uf2
+          if-no-files-found: warn
