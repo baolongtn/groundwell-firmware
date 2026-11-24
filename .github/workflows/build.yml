@@ -23,7 +23,11 @@ jobs:
           arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli config add board_manager.additional_urls https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32
+          # The hub uses the 3.x BLE API (BLEDevice.h). Core 4.0 replaced it with a new BLE.h API,
+          # so stay on the newest 3.x until the hub is ported.
+          ESP32_V=$(arduino-cli core search esp32:esp32 --all | grep -oE '\b3\.[0-9]+\.[0-9]+\b' | sort -uV | tail -1)
+          echo "Using esp32:esp32@$ESP32_V"
+          arduino-cli core install "esp32:esp32@$ESP32_V"
           arduino-cli core install Seeeduino:nrf52
           arduino-cli lib install "DHT sensor library" "Adafruit Unified Sensor" "Adafruit VEML7700 Library"
           arduino-cli core list
