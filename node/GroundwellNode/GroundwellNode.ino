@@ -179,6 +179,16 @@ static CalData cal;
 static bool calOk = false;
 static uint16_t pendAir = 0, pendWater = 0;           // this session's CAL AIR / CAL WATER results
 static uint32_t lastSentAt = 0;                       // for the dt= cadence check in the serial log
+
+// Hub link (v0.10): the key the hub proved or set, kept in flash like the calibration
+static const char *KEY_FILE = "/gwkey.bin";
+static const uint32_t KEY_MAGIC = 0x4B455931;        // "KEY1"
+struct KeyData { uint32_t magic; uint8_t key[16]; uint32_t check; };
+static uint8_t linkKey[16];
+static volatile bool keyOk = false, keyDirty = false, authed = false;
+static uint8_t nonce[16];
+static float lastVdd = 0;
+static SemaphoreHandle_t wakeSem;                    // lets a Bluetooth event wake the main loop early
 static uint32_t fastUntil = 0;                        // FAST command: 5 s readings until this millis()
 // Declared here, before any function: the Arduino IDE puts a prototype of every function above the first one.
 struct AirFilter { bool have, pend; float t, h, pt, ph; };
@@ -658,14 +668,6 @@ BLECharacteristic gwNonce(UUID_GW_NONCE);            // read: 16 random bytes, n
 BLECharacteristic gwAuth(UUID_GW_AUTH);              // write: first 16 bytes of HMAC-SHA256(link key, nonce)
 BLECharacteristic gwKey(UUID_GW_KEY);                // write: a new 16-byte link key (in the window, or once authenticated)
 
-static const char *KEY_FILE = "/gwkey.bin";
-static const uint32_t KEY_MAGIC = 0x4B455931;        // "KEY1"
-struct KeyData { uint32_t magic; uint8_t key[16]; uint32_t check; };
-static uint8_t linkKey[16];
-static volatile bool keyOk = false, keyDirty = false, authed = false;
-static uint8_t nonce[16];
-static float lastVdd = 0;
-static SemaphoreHandle_t wakeSem;                    // lets a Bluetooth event wake the main loop early
 
 static uint32_t keyCheck(const KeyData &k) {
   uint32_t h = 2166136261u;
