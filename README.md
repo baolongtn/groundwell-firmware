@@ -1,6 +1,6 @@
 # groundwell-firmware
 
-Firmware for GROUNDWELL: the XIAO nRF52840 sensor node and the XIAO ESP32-C6 hub. Current version: **node v0.9.1, hub v0.9.1**. Both update over the air ([SETUP.md section 6](docs/SETUP.md#6-update-over-the-air)).
+Firmware for GROUNDWELL: the XIAO nRF52840 sensor node and the XIAO ESP32-C6 hub. Current version: **node v0.10.0, hub v0.10.0**. Update the hub over the air and it updates its nodes over Bluetooth ([SETUP.md section 6](docs/SETUP.md#6-update-over-the-air)).
 
 The cloud (Cloudflare Worker + D1, dashboard, health engine) lives in [groundwell-cloud](https://github.com/baolongtn/groundwell-cloud).
 
@@ -8,7 +8,7 @@ The cloud (Cloudflare Worker + D1, dashboard, health engine) lives in [groundwel
 |---|---|
 | `node/GroundwellNode` | Arduino sketch for the XIAO nRF52840: soil probes, air, light and UV, broadcast as BTHome v2 |
 | `hub/GroundwellHub` | Arduino sketch for the XIAO ESP32-C6: hears the nodes, serves the live dashboard, uploads to the cloud |
-| `tools` | `factory_cal.py` (factory calibration fixture), `fake_node_pty.py` (fake node for testing the fixture), and the packet, photoresistor and sensor-math tests |
+| `tools` | `factory_cal.py` (factory calibration fixture), `fake_node_pty.py` (fake node for testing the fixture), `make_node_fw_h.py` (bundles the node firmware into the hub), and host tests: node update protocol against a simulated bootloader, link-key HMAC, packets, photoresistor, sensor math |
 | `legacy/wired-prototype` | The original wired ESP32-C6 sketches and the light-sensor test sketch |
 | `docs/SETUP.md` | Full setup guide: wiring, flashing, factory calibration, cloud, dashboards, verification |
 

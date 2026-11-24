@@ -8,7 +8,7 @@
   LTR390 / VEML7700 / GL5539 light, LTR390 UV                                                air + light history, once a minute
 ```
 
-**Versions:** node firmware v0.9.1, hub firmware v0.9.1 (both can now be updated over the air, section 6), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
+**Versions:** node firmware v0.10.0, hub firmware v0.10.0 (the hub updates its nodes for you, section 6), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
 
 **New in v0.9**
 - **Battery profile, on USB or battery alike.** The node reads every 30 s instead of 5 s, broadcasts each reading in a 6 s burst and then turns the radio off, and keeps every sensor powered down or in standby between readings. The CPU already slept between readings.
@@ -324,11 +324,21 @@ Firmware files come from the GitHub build: every push to `groundwell-firmware` b
 - **What gets rejected:** the merged file, node files and other chips' firmware are refused before anything is written. A dropped upload changes nothing.
 - **Settings later:** `http://plants.local/setup` (same password). Or hold the **BOOT** button for 3 s: the setup hotspot opens for 15 minutes, which is the way back in if you change routers or forget the password. If the saved Wi-Fi isn't found within 3 minutes of power-up, the hotspot opens on its own and closes once Wi-Fi is back.
 
-### Nodes
+### Nodes: the hub updates them
 
-- For **10 minutes after power-up or a reset**, a node accepts Bluetooth connections. After that it goes back to short broadcasts that nobody can connect to.
-- **To update:** press the node's reset button once (twice puts it into USB mode instead). On your phone, open **nRF Connect for Mobile**, connect to **GW**, tap **DFU**, and pick `GroundwellNode.ino.zip`. It takes about a minute; the node then restarts on the new firmware with its factory calibration intact.
-- There is no automatic rollback on the node. If an update is interrupted, the node waits in its bootloader; run the update again, or flash the `.uf2` over USB.
+The hub carries the node firmware inside its own. Update the hub and it brings every node up to the same version over Bluetooth, one node at a time.
+
+- **What happens:** about a minute after the hub starts, it checks each node during one of its 30-second bursts. A node on older firmware gets the new one: it hands over to its bootloader, the hub sends the file (1 to 2 minutes), and the node restarts with its calibration intact. After that the hub checks each node once a day.
+- **Linking:** a node only accepts updates from the hub it's linked to. A node links to the hub that reaches it in the **10 minutes after its power-up or a reset**; the hub does this on its own. A node linked to another hub, or never linked, shows "press its reset button": press it once and the hub links it within a minute.
+- **Battery:** the hub only updates a node whose battery reads 2.7 V or more; otherwise the update waits.
+- **Where to watch:** `http://plants.local/update` has a **Nodes** table (firmware and status for each). The Admin view of the dashboard shows the same on each card. Serial Monitor on the hub prints every step as `Node EE:FF: ...`.
+- **If an update fails,** the node goes back to its old firmware and the hub tries again later (10 minutes, then longer gaps), with the smaller packet size older bootloaders need. If a node doesn't come back at all, the hub looks for its bootloader and finishes the job. After 4 failures it says "flash it over USB".
+- **Nodes on v0.9.1** only accept connections in their 10-minute window. After the hub is on v0.10, press each one's reset button once; the hub updates it, then links it.
+- **Building the hub yourself:** the GitHub build bundles the node firmware automatically. In Arduino IDE, export the node first (Sketch > Export Compiled Binary), then run `python tools/make_node_fw_h.py node/GroundwellNode/build/<board folder>/GroundwellNode.ino.zip` before compiling the hub. Without that file the hub still checks and links nodes, but doesn't update them.
+
+### Nodes: from a phone
+
+Still works, for a node the hub can't reach: press its reset button once, then in **nRF Connect for Mobile** connect to **GW**, tap **DFU** and pick `GroundwellNode.ino.zip`. In those 10 minutes a node accepts an update without the link key; after them, only its hub can start one. No automatic rollback on the node: an interrupted update leaves it in its bootloader, so run it again or flash the `.uf2` over USB.
 
 ## Verified before release
 
@@ -378,7 +388,9 @@ Firmware files come from the GitHub build: every push to `groundwell-firmware` b
 - **Server identity isn't verified yet.** The hub's connection to Cloudflare is encrypted, but `setInsecure()` means it doesn't check the server's certificate. Before shipping to anyone else, pin the certificate authority.
 - **Calibration source:** "Set dry/wet = now" uses the latest reading the hub received, up to 5 s old. Wait for one update after moving a probe.
 - **Setup hotspot password:** every hub uses the same default (`SETUP_AP_PASS`). A product needs one per unit, printed on its label.
-- **Updates aren't signed yet.** The hub's `/update` and Arduino IDE uploads need the update password, and a node only accepts an update in the 10 minutes after a reset, but neither checks who built the file. Next steps: the hub pulls signed builds from Cloudflare, then passes node updates on over Bluetooth.
+- **Updates aren't signed yet.** The hub's `/update` and Arduino IDE uploads need the update password, and a node accepts an update only from its linked hub (or anyone, in the 10 minutes after a reset), but nothing checks who built the file. Next step: the hub pulls signed builds from Cloudflare.
+- **The hub is 94% full** (1.86 of 1.97 MB) now that it carries the node firmware. The next step moves the node file out of the hub: the hub downloads it from Cloudflare when a node needs it.
+- **Linking trusts the first hub.** A node links to whichever hub reaches it first in its 10-minute window, which could be a neighbor's GROUNDWELL hub. Pressing reset with your hub nearby links it back.
 - **The diagnoses are heuristics, not lab tests.** They're built on standard plant physics (transpiration driven by VPD and light) and tested against a simulator, not yet against real failing plants. Treat "root rot risk" as "go look at the roots".
 - **Lux is not plant light.** The conversion assumes daylight. Under white LED grow lights, the light score reads about 20% high.
 - **Photoresistors can't go in a product sold in the EU.** They contain cadmium sulfide, which RoHS restricts. The product node should use a silicon sensor: the sketch's VEML7700 mode, or an analog phototransistor such as the ALS-PT19 in the same divider with a new resistor value. The photoresistor also reads purple grow lights poorly.

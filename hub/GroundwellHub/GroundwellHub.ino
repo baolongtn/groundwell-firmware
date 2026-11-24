@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL hub v0.9.1
+  GROUNDWELL hub v0.10.0
   Board: Seeed XIAO ESP32-C6, Arduino core "esp32 by Espressif Systems" 3.x (NOT 4.x: it replaced the BLE API),
          board "XIAO_ESP32C6", Tools > Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)".
          The menu only sets the IDE's size check: partitions.csv in this folder replaces the layout with two
@@ -10,6 +10,12 @@
     - Arduino IDE: the hub shows up under Tools > Port as a network port; upload as usual.
     - A new firmware runs on trial. If it crashes 3 times before it proves itself (Wi-Fi up, a node heard,
       a cloud upload accepted, 10 minutes running), the hub goes back to the previous firmware on its own.
+  Node updates (v0.10)
+    - The hub carries the node firmware inside its own (node_fw.h, made from the node build; the GitHub build
+      does this). After a hub update it checks every node, links new ones and updates old ones over Bluetooth,
+      one at a time, only on a healthy battery. Status per node: dashboard (Admin) and /update.
+    - Linking: a node learns this hub's link key in the 10 minutes after its power-up or reset. After that
+      only this hub (proving the key) can update it. A node linked elsewhere: press its reset button once.
   Setup page (v0.9.1)
     - Wi-Fi, cloud URL, ingest key and the update password live in the hub's own memory, set on /setup.
     - No Wi-Fi saved, or none found within 3 minutes of power-up, or the BOOT button held for 3 s:
@@ -46,6 +52,10 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <BLEClient.h>
+#if defined(CONFIG_BLUEDROID_ENABLED)
+  #include <esp_gattc_api.h>
+#endif
 #include <Update.h>
 #include <ArduinoOTA.h>
 #include <DNSServer.h>
@@ -55,6 +65,19 @@
 #include <time.h>
 #include "bthome.h"
 #include "page.h"
+#include "gw_hmac.h"
+#include "node_dfu.h"
+#if __has_include("node_fw.h")
+  #include "node_fw.h"                 // the node firmware to hand out (tools/make_node_fw_h.py; the GitHub build makes it)
+#endif
+#ifndef NODE_FW_BUNDLED
+  #define NODE_FW_BUNDLED 0
+  static const char NODE_FW_VERSION[] = "";
+  static const uint8_t NODE_FW_BIN[4] = {0};
+  static const uint32_t NODE_FW_LEN = 0;
+  static const uint8_t NODE_FW_DAT[2] = {0};
+  static const uint16_t NODE_FW_DAT_LEN = 0;
+#endif
 
 // The IDE checks the sketch size against the Partition Scheme menu, and the other choices on this board
 // are too small (Default allows 1.25 MB). partitions.csv still sets the real layout.
@@ -67,9 +90,9 @@
   #define GW_CRASH_TEST 0      // 1 = rollback test build: crashes 20 s after every boot (the GitHub build makes one)
 #endif
 #if GW_CRASH_TEST
-  #define GW_FW_VERSION "0.9.1-crashtest"
+  #define GW_FW_VERSION "0.10.0-crashtest"
 #else
-  #define GW_FW_VERSION "0.9.1"
+  #define GW_FW_VERSION "0.10.0"
 #endif
 static const char *FW_VERSION = GW_FW_VERSION;
 // Optional secrets.h (git-ignored): WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY and optionally OTA_PASS.
@@ -138,6 +161,16 @@ struct Node {
   uint32_t airAt, climQueuedAt, luxAt, lightQueuedAt, uvAt;
   uint8_t batt;
   uint32_t lastFreshAt, ivlMs;   // time between new packets (smoothed): should be NODE_INTERVAL_MS
+  // node updates (v0.10)
+  uint8_t addrType;              // Bluetooth address type from its adverts (random static for these nodes)
+  bool connectable;              // its last advert accepted connections
+  char fw[16];                   // firmware version it reported ("" = not checked yet)
+  char st[56];                   // update status for the dashboard
+  uint8_t pct;                   // update progress, percent
+  bool updating, smallPkts;      // smallPkts: its bootloader only takes 20-byte packets
+  uint32_t nextCheckAt;          // millis() of the next check (0 = soon)
+  uint8_t fails;                 // failed updates in a row (sets the backoff)
+  uint32_t rescueAt;             // after a failed transfer: look for its bootloader if it doesn't come back
 };
 
 struct Sensor {
@@ -207,6 +240,9 @@ bool apOn = false, everConnected = false, otaBusy = false, arduinoOtaUp = false,
 uint32_t apCloseAt = 0, apIdleSince = 0;     // apCloseAt 0 = no BOOT-button window
 volatile uint32_t advTotal = 0;              // BTHome packets heard since boot (one of the trial checks)
 bool trialActive = false;                    // this firmware is new and hasn't passed its trial yet
+uint8_t nodeKey[16];                         // this hub's link key for its nodes (random, made on first boot)
+volatile bool jobBusy = false;               // a node check or update is running (Bluetooth scan paused)
+uint32_t jobStartedAt = 0;
 
 // ---------------- helpers ----------------
 static int clampPct(long p) { return p < 0 ? 0 : (p > 100 ? 100 : (int)p); }
@@ -285,7 +321,7 @@ static void enqueue(uint8_t node, uint8_t ch, uint16_t raw) {
 }
 
 // ---------------- BLE ----------------
-static void handlePacket(const char *mac, int rssi, const BTHomePacket &p) {
+static void handlePacket(const char *mac, int rssi, uint8_t addrType, bool connectable, const BTHomePacket &p) {
   if (p.nCounts == 0 && !p.hasMoist) return;
   advHeard++;
   advTotal++;
@@ -295,12 +331,16 @@ static void handlePacket(const char *mac, int rssi, const BTHomePacket &p) {
     Node &n = nodes[ni];
     n.lastSeen = millis();
     n.rssi = (int8_t)rssi;
+    n.addrType = addrType;
+    n.connectable = connectable;
+    n.rescueAt = 0;                                       // it's running its app again
     bool fresh = !p.hasPid || !n.havePid || p.pid != n.lastPid;
     if (fresh) {
       advFresh++;
       if (p.hasPid && n.havePid) {
         uint8_t gap = (uint8_t)(p.pid - n.lastPid);
         if (gap > 1 && gap < 50) n.lost += gap - 1;      // bigger jumps = node rebooted
+        if (p.pid <= 2 && n.lastPid > 2 && !n.updating) n.nextCheckAt = 0;   // just restarted: its link window is open, check now
       }
       if (p.hasPid) { n.lastPid = p.pid; n.havePid = true; }
       n.rx++;
@@ -372,7 +412,7 @@ class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
       if (!parseBTHome((const uint8_t *)sd.c_str(), sd.length(), p)) continue;
       String mac = String(dev.getAddress().toString().c_str());
       mac.toUpperCase();
-      handlePacket(mac.c_str(), dev.getRSSI(), p);
+      handlePacket(mac.c_str(), dev.getRSSI(), dev.getAddressType(), dev.isConnectable(), p);
     }
   }
 };
@@ -397,7 +437,7 @@ static void pushDay() {
 static void applyCloudCfg(const String &resp);
 
 static void uploadBatch() {
-  if (otaBusy || cfg.url.length() == 0 || WiFi.status() != WL_CONNECTED) return;
+  if (otaBusy || jobBusy || cfg.url.length() == 0 || WiFi.status() != WL_CONNECTED) return;
 
   // Snapshot up to 240 readings plus the sensor names/calibration, then release the lock.
   String body;
@@ -569,6 +609,10 @@ static void handleLive() {
     j += ",\"brssi\":"; j += nd.rssi;
     j += ",\"ageS\":"; j += (now - nd.lastSeen) / 1000;
     j += ",\"loss\":"; j += tot ? String(100.0f * nd.lost / tot, 1) : String("0");
+    j += ",\"nfw\":\""; j += nd.fw;
+    j += "\",\"nst\":\""; j += nd.st;
+    if (nd.updating) { j += " ("; j += nd.pct; j += "%)"; }
+    j += '"';
     j += '}';
   }
   j += "]}";
@@ -723,6 +767,11 @@ static void loadConfig() {
   cfg.url   = cfgPrefs.getString("url", "");
   cfg.key   = cfgPrefs.getString("key", "");
   cfg.otapw = cfgPrefs.getString("otapw", "");
+  if (cfgPrefs.getBytesLength("nodekey") != sizeof nodeKey) {
+    esp_fill_random(nodeKey, sizeof nodeKey);
+    cfgPrefs.putBytes("nodekey", nodeKey, sizeof nodeKey);
+  }
+  cfgPrefs.getBytes("nodekey", nodeKey, sizeof nodeKey);
 }
 
 // ---------------- setup hotspot ----------------
@@ -912,6 +961,22 @@ static void handleUpdatePage() {
          "const d=new FormData();d.append('firmware',f);x.send(d)}</script>";
     b += "<p class=note>The new firmware runs on trial. If it crashes 3 times before it proves itself, the hub goes back to this one.</p>";
   }
+  b += "<h1>Nodes</h1><p class=note>";
+  if (NODE_FW_BUNDLED) { b += "This hub carries node firmware <b>"; b += NODE_FW_VERSION; b += "</b> and updates its nodes to it over Bluetooth."; }
+  else b += "This hub build carries no node firmware, so it checks its nodes but doesn't update them.";
+  b += "</p><table>";
+  xSemaphoreTake(lock, portMAX_DELAY);
+  int shown = 0;
+  for (int i = 0; i < MAX_NODES; i++) if (nodes[i].used) {
+    shown++;
+    b += "<tr><td>"; b += nodes[i].mac + 9; b += "</td><td>"; b += nodes[i].fw[0] ? nodes[i].fw : "?"; b += "</td><td>";
+    b += htmlEsc(nodes[i].st[0] ? String(nodes[i].st) : String("not checked yet"));
+    if (nodes[i].updating) { b += " ("; b += nodes[i].pct; b += "%)"; }
+    b += "</td></tr>";
+  }
+  xSemaphoreGive(lock);
+  if (!shown) b += "<tr><td>No nodes heard yet.</td></tr>";
+  b += "</table>";
   sendPage(200, b);
 }
 
@@ -927,6 +992,7 @@ static void handleUpdateUpload() {
     const esp_partition_t *run = esp_ota_get_running_partition();
     if (!esp_ota_get_next_update_partition(NULL)) { upErr = "This hub has a single app slot: flash it over USB once."; return; }
     if (run && ESP.getSketchSize() > run->size) { upErr = "The running firmware is bigger than its slot: flash over USB."; return; }
+    if (jobBusy) { upErr = "The hub is updating a node right now. Try again in a few minutes."; return; }
     otaBusy = true;
     scan->stop();                                   // give Wi-Fi the radio while the file comes in
     if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) upErr = String("Couldn't start: ") + Update.errorString();
@@ -980,9 +1046,273 @@ static void startArduinoOta() {   // Arduino IDE network uploads, with the same 
   ArduinoOTA.onStart([]() { otaBusy = true; scan->stop(); Serial.println("Arduino IDE upload started"); });
   ArduinoOTA.onProgress([](unsigned int, unsigned int) { esp_task_wdt_reset(); });
   ArduinoOTA.onEnd([]() { trialStart(); Serial.println("Arduino IDE upload done: restarting into the new firmware"); });
-  ArduinoOTA.onError([](ota_error_t e) { otaBusy = false; scan->start(0, nullptr, false); Serial.printf("Arduino IDE upload failed (error %u)\n", (unsigned)e); });
+  ArduinoOTA.onError([](ota_error_t e) { otaBusy = false; if (!jobBusy) scan->start(0, nullptr, false); Serial.printf("Arduino IDE upload failed (error %u)\n", (unsigned)e); });
   ArduinoOTA.begin();
   arduinoOtaUp = true;
+}
+
+// ---------------- node checks, linking and updates over Bluetooth (v0.10) ----------------
+// One job at a time, in its own task, with the Bluetooth scan paused. A job connects to a node during one
+// of its bursts, reads its firmware version, links it (window after its reset) or proves the link key,
+// and if the bundled node firmware is newer, hands it to the node's bootloader (node_dfu.h).
+static const char *GW_SVC   = "6a1c0001-5f2b-4c1e-9d55-67726f756e64";
+static const char *GW_INFO  = "6a1c0002-5f2b-4c1e-9d55-67726f756e64";
+static const char *GW_NONCE = "6a1c0003-5f2b-4c1e-9d55-67726f756e64";
+static const char *GW_AUTH  = "6a1c0004-5f2b-4c1e-9d55-67726f756e64";
+static const char *GW_KEY   = "6a1c0005-5f2b-4c1e-9d55-67726f756e64";
+static const char *DFU_SVC  = "00001530-1212-efde-1523-785feabcd123";
+static const char *DFU_CTRL = "00001531-1212-efde-1523-785feabcd123";
+static const char *DFU_PKT  = "00001532-1212-efde-1523-785feabcd123";
+static const uint32_t CHECK_EVERY_MS = 24UL * 3600 * 1000;
+static const float    UPDATE_MIN_V   = 2.7f;      // below this a coin cell may sag mid-update: wait
+static const uint32_t JOB_MAX_MS     = 8UL * 60 * 1000;
+
+static BLEClient *nodeClient = nullptr;            // one client for the hub's lifetime (the library keeps a pointer to it)
+static QueueHandle_t notifQ;
+struct Notif { uint8_t n; uint8_t d[20]; };
+static int jobNode = -1;
+static bool jobRescue = false;
+
+static void onDfuNotify(BLERemoteCharacteristic *, uint8_t *data, size_t len, bool) {
+  Notif m;
+  m.n = len > sizeof m.d ? sizeof m.d : len;
+  memcpy(m.d, data, m.n);
+  xQueueSend(notifQ, &m, 0);
+}
+
+struct BleDfuLink : DfuLink {
+  BLERemoteCharacteristic *ctrl = nullptr, *pkt = nullptr;
+  int node = 0;
+  bool writeCtrl(const uint8_t *d, size_t n) override { return ctrl->writeValue((uint8_t *)d, n, true); }
+  bool writePkt(const uint8_t *d, size_t n) override {   // without response: retry while the stack's buffers are full
+    for (int tries = 0; tries < 400; tries++) {
+      if (pkt->writeValue((uint8_t *)d, n, false)) return true;
+      if (!nodeClient->isConnected()) return false;
+      delay(2);
+    }
+    return false;
+  }
+  bool waitNotify(uint8_t *out, size_t &n, uint32_t ms) override {
+    Notif m;
+    if (xQueueReceive(notifQ, &m, pdMS_TO_TICKS(ms)) != pdTRUE) return false;
+    memcpy(out, m.d, m.n); n = m.n;
+    return true;
+  }
+  void drain() override { xQueueReset(notifQ); }
+  void progress(uint32_t done, uint32_t total) override { nodes[node].pct = (uint8_t)(done * 100ULL / total); }
+};
+
+static void nodeStatus(int i, const char *fmt, ...) {
+  char b[sizeof nodes[0].st];
+  va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+  xSemaphoreTake(lock, portMAX_DELAY);
+  strlcpy(nodes[i].st, b, sizeof nodes[i].st);
+  xSemaphoreGive(lock);
+  Serial.printf("Node %s: %s\n", nodes[i].mac + 12, b);
+}
+
+static bool nodeConnect(const char *mac, uint8_t type, bool plusOne, uint32_t ms) {
+  char m[18];
+  strlcpy(m, mac, sizeof m);
+  if (plusOne) {                                   // the bootloader's address when it starts without handover data:
+    unsigned last = strtoul(m + 15, nullptr, 16);  // lowest byte + 1, the last pair in "AA:BB:CC:DD:EE:FF"
+    snprintf(m + 15, 3, "%02X", (last + 1) & 0xFF);
+  }
+  BLEAddress a{String(m), type};                   // (byte order differs between Bluetooth stacks; the text doesn't)
+#if defined(CONFIG_BLUEDROID_ENABLED)
+  esp_ble_gattc_cache_refresh(a.getNative());     // same address, different services once it's the bootloader
+#endif
+  if (!nodeClient->connect(a, type, ms)) return false;
+  nodeClient->getServices();                       // fresh lookup: the client would otherwise reuse the last list
+  return true;
+}
+
+static void nodeDisconnect() {
+  if (nodeClient->isConnected()) nodeClient->disconnect();
+  for (uint32_t t = millis(); nodeClient->isConnected() && millis() - t < 3000;) delay(20);
+}
+
+static uint32_t nodeFailed(int i, const char *why) {
+  uint8_t f = ++nodes[i].fails;
+  uint32_t mins = f >= 6 ? 360 : 10u << (f - 1);   // 10, 20, 40, 80, 160 min, then 6 h
+  nodeStatus(i, "update failed (%s); retry in %lu min", why, (unsigned long)mins);
+  return mins * 60000UL;
+}
+
+static bool nodeAuth(BLERemoteService *gw) {       // prove the link key: HMAC over the node's fresh nonce
+  BLERemoteCharacteristic *cn = gw->getCharacteristic(BLEUUID(GW_NONCE)), *ca = gw->getCharacteristic(BLEUUID(GW_AUTH));
+  if (!cn || !ca) return false;
+  String n = cn->readValue();
+  const uint8_t *raw = cn->readRawData();
+  if (n.length() != 16 || !raw) return false;
+  uint8_t tag[32];
+  gw_hmac_sha256(nodeKey, sizeof nodeKey, raw, 16, tag);
+  return ca->writeValue(tag, 16, true);
+}
+
+// The bootloader is running (just handed over, or stuck after a failed try): send it the firmware.
+static uint32_t nodeTransfer(int i, const char *mac, uint8_t type, bool small) {
+  bool up = false;
+  for (int a = 0; a < 6 && !up; a++) up = nodeConnect(mac, type, a & 1, 4000);   // same address first, then +1
+  if (!up) { nodes[i].rescueAt = (millis() + 90000) | 1; return nodeFailed(i, "its bootloader didn't answer"); }
+  BLERemoteService *dfu = nodeClient->getService(BLEUUID(DFU_SVC));
+  BleDfuLink link;
+  link.node = i;
+  link.ctrl = dfu ? dfu->getCharacteristic(BLEUUID(DFU_CTRL)) : nullptr;
+  link.pkt  = dfu ? dfu->getCharacteristic(BLEUUID(DFU_PKT)) : nullptr;
+  if (!link.ctrl || !link.pkt) { nodeDisconnect(); nodes[i].rescueAt = (millis() + 90000) | 1; return nodeFailed(i, "no update service in its bootloader"); }
+  xQueueReset(notifQ);
+  link.ctrl->registerForNotify(onDfuNotify);
+  uint16_t mtu = nodeClient->getMTU();
+  uint16_t pkt = (small || mtu <= 23) ? 20 : (uint16_t)((mtu - 3 > 244 ? 244 : mtu - 3) & ~3);
+  Serial.printf("Node %s: sending %lu bytes in %u-byte packets (MTU %u)\n", mac + 12, (unsigned long)NODE_FW_LEN, pkt, mtu);
+  uint32_t t0 = millis();
+  char err[96];
+  const char *e = dfuTransfer(link, NODE_FW_BIN, NODE_FW_LEN, NODE_FW_DAT, NODE_FW_DAT_LEN, pkt, 8, err, sizeof err);
+  if (e) {
+    uint8_t r = DFU_OP_RESET;
+    if (nodeClient->isConnected()) link.ctrl->writeValue(&r, 1, false);   // bootloader restarts: back to the old firmware
+    nodeDisconnect();
+    if (pkt > 20) nodes[i].smallPkts = true;      // an older bootloader only takes 20-byte packets: use those next time
+    nodes[i].rescueAt = (millis() + 90000) | 1;
+    return nodeFailed(i, e);
+  }
+  nodeDisconnect();
+  nodes[i].fails = 0;
+  nodes[i].rescueAt = 0;
+  nodeStatus(i, "updated to %s in %lu s", NODE_FW_VERSION, (unsigned long)((millis() - t0) / 1000));
+  return 45000;                                    // check its new version (and link it) on a later burst
+}
+
+static uint32_t nodeCheck(int i, const char *mac, uint8_t type, float volt, bool small) {
+  if (!nodeConnect(mac, type, false, 5000)) return 120000;   // missed its burst: try again shortly, not a failure
+  String ver, info;
+  bool linked = false, window = false;
+  float v = volt;
+  BLERemoteService *gw = nodeClient->getService(BLEUUID(GW_SVC));
+  if (gw) {
+    BLERemoteCharacteristic *ci = gw->getCharacteristic(BLEUUID(GW_INFO));
+    if (ci) info = ci->readValue();                // "0.10.0;l=1;w=0;v=3.29"
+    int semi = info.indexOf(';');
+    ver = semi >= 0 ? info.substring(0, semi) : info;
+    linked = info.indexOf(";l=1") >= 0;
+    window = info.indexOf(";w=1") >= 0;
+    int vi = info.indexOf(";v=");
+    if (vi >= 0) v = info.substring(vi + 3).toFloat();
+  } else {                                         // before v0.10: version from Device Information
+    BLERemoteService *dis = nodeClient->getService(BLEUUID((uint16_t)0x180A));
+    BLERemoteCharacteristic *cs = dis ? dis->getCharacteristic(BLEUUID((uint16_t)0x2A28)) : nullptr;
+    if (cs) ver = cs->readValue();
+  }
+  ver.trim();
+  String clean;                                    // keep it to a plain version string (it goes into the page and JSON)
+  for (size_t k = 0; k < ver.length() && clean.length() < 15; k++) { char ch = ver[k]; if (isalnum((unsigned char)ch) || ch == '.' || ch == '-') clean += ch; }
+  ver = clean;
+  xSemaphoreTake(lock, portMAX_DELAY);
+  strlcpy(nodes[i].fw, ver.length() ? ver.c_str() : "?", sizeof nodes[i].fw);
+  xSemaphoreGive(lock);
+
+  if (gw && !(linked && nodeAuth(gw))) {
+    if (window) {                                  // the node was just reset: link it to this hub
+      BLERemoteCharacteristic *ck = gw->getCharacteristic(BLEUUID(GW_KEY));
+      bool ok = ck && ck->writeValue(nodeKey, sizeof nodeKey, true);
+      nodeDisconnect();
+      nodeStatus(i, ok ? "linked to this hub" : "linking failed");
+      return ok ? 40000 : 120000;
+    }
+    nodeDisconnect();
+    nodeStatus(i, linked ? "linked to another hub: press its reset button" : "not linked: press its reset button");
+    return 3600000;
+  }
+  if (!NODE_FW_BUNDLED || dfuVersionCompare(NODE_FW_VERSION, ver.c_str()) <= 0) {
+    nodeDisconnect();
+    nodes[i].fails = 0;
+    nodeStatus(i, "up to date (%s)", ver.length() ? ver.c_str() : "?");
+    return CHECK_EVERY_MS;
+  }
+  if (v > 0.5f && v < UPDATE_MIN_V) {
+    nodeDisconnect();
+    nodeStatus(i, "battery %.2f V: update to %s waits", v, NODE_FW_VERSION);
+    return 6UL * 3600 * 1000;
+  }
+  BLERemoteService *dfu = nodeClient->getService(BLEUUID(DFU_SVC));
+  BLERemoteCharacteristic *ctrl = dfu ? dfu->getCharacteristic(BLEUUID(DFU_CTRL)) : nullptr;
+  if (!ctrl) { nodeDisconnect(); nodeStatus(i, "%s has no update service: flash it over USB", ver.c_str()); return CHECK_EVERY_MS; }
+  ctrl->registerForNotify(onDfuNotify);            // the node only hands over with notifications on
+  nodes[i].updating = true;
+  nodes[i].pct = 0;
+  nodeStatus(i, "updating %s to %s", ver.c_str(), NODE_FW_VERSION);
+  uint8_t go[2] = {DFU_OP_START, DFU_IMAGE_APP};
+  bool ok = ctrl->writeValue(go, 2, true);
+  if (!ok && nodeClient->isConnected()) {          // refused (an old node outside its window): it's still running
+    nodeDisconnect();
+    nodes[i].updating = false;
+    nodeStatus(i, "%s refused the update: press its reset button", ver.c_str());
+    return 3600000;
+  }
+  nodeDisconnect();                                // the node is restarting into its bootloader
+  delay(1500);
+  uint32_t next = nodeTransfer(i, mac, type, small);
+  nodes[i].updating = false;
+  return next;
+}
+
+static void nodeJobTask(void *) {
+  int i = jobNode;
+  char mac[18];
+  xSemaphoreTake(lock, portMAX_DELAY);
+  strlcpy(mac, nodes[i].mac, sizeof mac);
+  uint8_t type = nodes[i].addrType;
+  float volt = nodes[i].volt;
+  bool small = nodes[i].smallPkts;
+  xSemaphoreGive(lock);
+  uint32_t next;
+  if (jobRescue) {
+    nodes[i].updating = true;
+    nodeStatus(i, "didn't come back: looking for its bootloader");
+    next = nodeTransfer(i, mac, type, true);
+    nodes[i].updating = false;
+  } else {
+    next = nodeCheck(i, mac, type, volt, small);
+  }
+  nodes[i].nextCheckAt = (millis() + next) | 1;
+  scan->start(0, nullptr, false);
+  jobBusy = false;
+  vTaskDelete(NULL);
+}
+
+// Called from loop(): start a job for a node that is advertising right now and is due, or rescue one
+// whose update failed and that hasn't come back.
+static void nodeUpdaterLoop() {
+  uint32_t now = millis();
+  if (jobBusy) {
+    if (now - jobStartedAt > JOB_MAX_MS) { Serial.println("Node update stuck: restarting the hub"); delay(200); ESP.restart(); }
+    return;
+  }
+  if (otaBusy || now < 60000 || !nodeClient) return;   // let the hub settle after boot
+  int pick = -1;
+  bool rescue = false;
+  xSemaphoreTake(lock, portMAX_DELAY);
+  for (int i = 0; i < MAX_NODES && pick < 0; i++) {
+    Node &n = nodes[i];
+    if (!n.used) continue;
+    if (n.rescueAt && (int32_t)(now - n.rescueAt) >= 0 && now - n.lastSeen > 60000) {
+      if (n.fails >= 4) { n.rescueAt = 0; strlcpy(n.st, "stuck in its bootloader: flash it over USB", sizeof n.st); continue; }
+      pick = i; rescue = true;
+    } else if (n.connectable && now - n.lastSeen < 2500 && (!n.nextCheckAt || (int32_t)(now - n.nextCheckAt) >= 0)) {
+      pick = i;
+    }
+  }
+  if (pick >= 0) nodes[pick].rescueAt = 0;
+  xSemaphoreGive(lock);
+  if (pick < 0) return;
+  jobBusy = true;
+  jobStartedAt = now;
+  jobNode = pick;
+  jobRescue = rescue;
+  scan->stop();
+  scan->clearResults();
+  if (xTaskCreate(nodeJobTask, "gwnode", 8192, nullptr, 1, nullptr) != pdPASS) { jobBusy = false; scan->start(0, nullptr, false); }
 }
 
 // ---------------- setup / loop ----------------
@@ -1010,6 +1340,9 @@ void setup() {
   configTime(0, 0, "pool.ntp.org", "time.google.com");   // UTC timestamps for the cloud
 
   BLEDevice::init("");
+  BLEDevice::setMTU(247);                                           // node updates: bigger packets if the bootloader allows
+  notifQ = xQueueCreate(16, sizeof(Notif));
+  nodeClient = BLEDevice::createClient();
   scan = BLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(new ScanCallbacks(), true);   // true = report every advert
   scan->setActiveScan(false);                                       // passive: listen only
@@ -1036,6 +1369,9 @@ void setup() {
   });
   server.begin();
   lastDayPush = lastUpload = millis();
+  Serial.printf(NODE_FW_BUNDLED ? "Node firmware %s bundled (%lu bytes): nodes are checked and updated from here\n"
+                                : "No node firmware bundled%s: nodes are checked, not updated\n",
+                NODE_FW_VERSION, (unsigned long)NODE_FW_LEN);
   if (trialActive) Serial.printf("Firmware %s is on trial (%u crashes allowed)\n", FW_VERSION, TRIAL_CRASHES - 1);
   if (!esp_ota_get_next_update_partition(NULL)) Serial.println("WARNING: no second app slot, so over-the-air updates are off. Flash once over USB.");
   startWatchdog();
@@ -1059,6 +1395,7 @@ void loop() {
   wasConnected = connected;
   if (arduinoOtaUp && connected) ArduinoOTA.handle();
   trialMaybeConfirm();
+  nodeUpdaterLoop();
 
   // Setup hotspot: open when no Wi-Fi is saved, when the saved one isn't found after power-up, or when the
   // BOOT button is held for 3 s. Wi-Fi retries pause while a phone is on it (they would knock it off).

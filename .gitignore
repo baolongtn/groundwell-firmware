@@ -22,3 +22,6 @@ __pycache__/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Generated: the node firmware bundled into the hub (tools/make_node_fw_h.py)
+hub/GroundwellHub/node_fw.h
