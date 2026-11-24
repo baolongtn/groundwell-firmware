@@ -111,7 +111,7 @@ static const uint32_t SETUP_OPEN_MS    = 15UL * 60 * 1000;   // hotspot opened w
 static const uint32_t TRIAL_MIN_MS     = 10UL * 60 * 1000;   // a new firmware must run this long (plus the checks) to be kept
 static const uint8_t  TRIAL_CRASHES    = 3;                  // crashes on trial before going back to the previous firmware
 static const uint32_t WATCHDOG_MS      = 60000;              // the main loop must come round within this, or the hub resets
-static const int      BOOT_PIN         = 9;                  // XIAO ESP32-C6 BOOT button
+static const int      SETUP_BTN_PIN    = BOOT_PIN;           // the BOOT button (GPIO 9 on the ESP32-C6)
 // ========================================================
 
 static const int MAX_NODES = 8, MAX_SENSORS = 16, LIVE_LEN = 720, DAY_LEN = 288, QUEUE_LEN = 3000, CLIM_LEN = 600, LIGHT_LEN = 600;
@@ -988,7 +988,7 @@ void setup() {
   prefs.begin("groundwell", false);
   trialCheckAtBoot();                              // may switch back to the previous firmware and restart
   loadConfig();
-  pinMode(BOOT_PIN, INPUT_PULLUP);
+  pinMode(SETUP_BTN_PIN, INPUT_PULLUP);
 
 #if USE_EXTERNAL_ANTENNA
   pinMode(3, OUTPUT); digitalWrite(3, LOW);    // enable the RF switch
@@ -1058,7 +1058,7 @@ void loop() {
   // BOOT button is held for 3 s. Wi-Fi retries pause while a phone is on it (they would knock it off).
   static uint32_t btnSince = 0;
   static bool btnFired = false;
-  if (digitalRead(BOOT_PIN) == LOW) {
+  if (digitalRead(SETUP_BTN_PIN) == LOW) {
     if (!btnSince) btnSince = now | 1;
     if (!btnFired && now - btnSince >= 3000) { btnFired = true; openSetup(SETUP_OPEN_MS, "BOOT button"); }
   } else { btnSince = 0; btnFired = false; }
