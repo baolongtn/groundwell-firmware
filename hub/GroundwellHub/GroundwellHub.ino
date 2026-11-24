@@ -53,7 +53,9 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 #include <BLEClient.h>
-#include <esp_gattc_api.h>
+#if defined(CONFIG_BLUEDROID_ENABLED)
+  #include <esp_gattc_api.h>
+#endif
 #include <Update.h>
 #include <ArduinoOTA.h>
 #include <DNSServer.h>
@@ -1082,7 +1084,14 @@ struct BleDfuLink : DfuLink {
   BLERemoteCharacteristic *ctrl = nullptr, *pkt = nullptr;
   int node = 0;
   bool writeCtrl(const uint8_t *d, size_t n) override { return ctrl->writeValue((uint8_t *)d, n, true); }
-  bool writePkt(const uint8_t *d, size_t n) override { return pkt->writeValue((uint8_t *)d, n, false); }
+  bool writePkt(const uint8_t *d, size_t n) override {   // without response: retry while the stack's buffers are full
+    for (int tries = 0; tries < 400; tries++) {
+      if (pkt->writeValue((uint8_t *)d, n, false)) return true;
+      if (!nodeClient->isConnected()) return false;
+      delay(2);
+    }
+    return false;
+  }
   bool waitNotify(uint8_t *out, size_t &n, uint32_t ms) override {
     Notif m;
     if (xQueueReceive(notifQ, &m, pdMS_TO_TICKS(ms)) != pdTRUE) return false;
@@ -1103,9 +1112,16 @@ static void nodeStatus(int i, const char *fmt, ...) {
 }
 
 static bool nodeConnect(const char *mac, uint8_t type, bool plusOne, uint32_t ms) {
-  BLEAddress a(String(mac), type);
-  if (plusOne) a.getNative()[5] += 1;              // the bootloader's address when it starts without handover data
+  char m[18];
+  strlcpy(m, mac, sizeof m);
+  if (plusOne) {                                   // the bootloader's address when it starts without handover data:
+    unsigned last = strtoul(m + 15, nullptr, 16);  // lowest byte + 1, the last pair in "AA:BB:CC:DD:EE:FF"
+    snprintf(m + 15, 3, "%02X", (last + 1) & 0xFF);
+  }
+  BLEAddress a{String(m), type};                   // (byte order differs between Bluetooth stacks; the text doesn't)
+#if defined(CONFIG_BLUEDROID_ENABLED)
   esp_ble_gattc_cache_refresh(a.getNative());     // same address, different services once it's the bootloader
+#endif
   if (!nodeClient->connect(a, type, ms)) return false;
   nodeClient->getServices();                       // fresh lookup: the client would otherwise reuse the last list
   return true;
