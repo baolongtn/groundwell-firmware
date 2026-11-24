@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL sensor node v0.9.1  (two soil probes + air temperature/humidity + light + UV, one board)
+  GROUNDWELL sensor node v0.10.0  (two soil probes + air temperature/humidity + light + UV, one board)
   Board:  Seeed XIAO nRF52840 (plain or Sense)
           Arduino IDE: Boards Manager URL
             https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
@@ -9,11 +9,14 @@
           Only if you set LIGHT_SENSOR to LIGHT_I2C: also install "Adafruit VEML7700 Library"
           (accept its "Adafruit BusIO" dependency). The SHT4x, AHT20 and LTR390 need no library.
 
-  Updates over Bluetooth (v0.9.1)
-    For DFU_WINDOW_MS (10 min) after power-up or a reset, the node advertises continuously and accepts a
-    connection, so a phone can update it: nRF Connect for Mobile > connect to "GW" > DFU > pick the
-    GroundwellNode.ino.zip from the build. After the window it goes back to short non-connectable bursts,
-    so nobody can reflash it from the street. Press reset (once) to open the window again.
+  Updates over Bluetooth
+    From the hub (v0.10): the hub carries this firmware inside its own. Every burst accepts a connection, and
+    a hub that proves it holds this node's link key (HMAC-SHA256 over a fresh random challenge) may start an
+    update. The node learns the key from the first hub that reaches it in the 10 minutes after power-up or a
+    reset ("linking"); after that only that hub, or someone pressing reset, can link or update it.
+    From a phone: for DFU_WINDOW_MS (10 min) after power-up or a reset, the node advertises continuously and
+    accepts an update without the key: nRF Connect for Mobile > connect to "GW" > DFU > GroundwellNode.ino.zip.
+    Serial command UNLINK forgets the link key.
 
   What it does
     Every REPORT_MS (30 s) it reads both probes, air temperature/humidity and light, then broadcasts one
@@ -92,7 +95,7 @@
     corrode, and soil polarization cancels out.
 */
 
-static const char *FW_VERSION = "0.9.1";
+static const char *FW_VERSION = "0.10.0";
 
 // ---------------- light sensor choice ----------------
 #define LIGHT_LDR      1                         // GL5539 photoresistor + DHT11, no I2C (the parts in hand)
@@ -101,6 +104,7 @@ static const char *FW_VERSION = "0.9.1";
 #define LIGHT_SENSOR   LIGHT_LDR                 // <-- change to LIGHT_I2C when you fit I2C sensors
 
 #include <bluefruit.h>
+#include "gw_hmac.h"
 #include <DHT.h>
 #include <Adafruit_LittleFS.h>
 #include <InternalFileSystem.h>
@@ -569,6 +573,7 @@ static void printInfo() {
 #else
   Serial.printf("air=%s uv=none ", airSrc);
 #endif
+  Serial.printf("link=%s ", keyOk ? "yes" : "no");
   if (calOk) Serial.printf("cal=yes air=%u water=%u OK\n", cal.air, cal.water);
   else       Serial.println("cal=no OK");
 }
@@ -581,6 +586,7 @@ static void handleCommand(char *line) {
   else if (!strcmp(line, "CAL WATER")) { if (measurePoint("WATER", pendWater)) { if (pendAir) finishCal(pendAir, pendWater); } else pendWater = 0; }
   else if (sscanf(line, "CAL SET %u %u", &a, &w) == 2) finishCal((uint16_t)a, (uint16_t)w);
   else if (!strcmp(line, "CAL CLEAR")) { InternalFS.remove(CAL_FILE); calOk = false; pendAir = pendWater = 0; Serial.println("CAL CLEARED OK"); }
+  else if (!strcmp(line, "UNLINK"))    { InternalFS.remove(KEY_FILE); keyOk = false; updateInfo(); Serial.println("UNLINKED OK"); }
   else if (!strcmp(line, "FAST"))      { fastUntil = millis() + FAST_FOR_MS; Serial.printf("FAST interval_ms=%lu for_s=%lu OK\n", (unsigned long)FAST_REPORT_MS, (unsigned long)(FAST_FOR_MS / 1000)); }
   else if (line[0]) Serial.printf("ERR unknown command: %s\n", line);
 }
@@ -637,26 +643,225 @@ static uint8_t buildBTHome(uint8_t *b, uint8_t pid, bool airOk, float tempC, flo
   return n;                                          // 26 bytes with air + light + UV (the legacy advert's limit), 14 with none
 }
 
-BLEDfu bledfu;                                       // Bluetooth update service (hands over to the bootloader)
 BLEDis bledis;                                       // device information: shows the firmware version in nRF Connect
 
 static bool dfuWindowOpen() { return DFU_WINDOW_MS && millis() < DFU_WINDOW_MS; }
 
+// ---------------- link to the hub (v0.10) ----------------
+// GROUNDWELL service 6a1c0001-5f2b-4c1e-9d55-67726f756e64 ("ground"), characteristics ...02 to ...05.
+#define GW_UUID(n) {0x64, 0x6e, 0x75, 0x6f, 0x72, 0x67, 0x55, 0x9d, 0x1e, 0x4c, 0x2b, 0x5f, n, 0x00, 0x1c, 0x6a}
+static const uint8_t UUID_GW_SVC[16] = GW_UUID(0x01), UUID_GW_INFO[16] = GW_UUID(0x02), UUID_GW_NONCE[16] = GW_UUID(0x03),
+                     UUID_GW_AUTH[16] = GW_UUID(0x04), UUID_GW_KEY[16] = GW_UUID(0x05);
+BLEService gwSvc(UUID_GW_SVC);
+BLECharacteristic gwInfo(UUID_GW_INFO);              // read: "0.10.0;l=1;w=0;v=3.29" (firmware; linked; window open; volts)
+BLECharacteristic gwNonce(UUID_GW_NONCE);            // read: 16 random bytes, new for every connection and attempt
+BLECharacteristic gwAuth(UUID_GW_AUTH);              // write: first 16 bytes of HMAC-SHA256(link key, nonce)
+BLECharacteristic gwKey(UUID_GW_KEY);                // write: a new 16-byte link key (in the window, or once authenticated)
+
+static const char *KEY_FILE = "/gwkey.bin";
+static const uint32_t KEY_MAGIC = 0x4B455931;        // "KEY1"
+struct KeyData { uint32_t magic; uint8_t key[16]; uint32_t check; };
+static uint8_t linkKey[16];
+static volatile bool keyOk = false, keyDirty = false, authed = false;
+static uint8_t nonce[16];
+static float lastVdd = 0;
+static SemaphoreHandle_t wakeSem;                    // lets a Bluetooth event wake the main loop early
+
+static uint32_t keyCheck(const KeyData &k) {
+  uint32_t h = 2166136261u;
+  const uint8_t *p = (const uint8_t *)&k;
+  for (size_t i = 0; i < offsetof(KeyData, check); i++) { h ^= p[i]; h *= 16777619u; }
+  return h;
+}
+
+static void loadKey() {
+  keyOk = false;
+  File f(InternalFS);
+  if (!f.open(KEY_FILE, FILE_O_READ)) return;
+  KeyData k;
+  bool ok = f.read(&k, sizeof k) == (int)sizeof k;
+  f.close();
+  if (ok && k.magic == KEY_MAGIC && k.check == keyCheck(k)) { memcpy(linkKey, k.key, 16); keyOk = true; }
+}
+
+static bool saveKey() {
+  KeyData k = {KEY_MAGIC, {0}, 0};
+  memcpy(k.key, linkKey, 16);
+  k.check = keyCheck(k);
+  InternalFS.remove(KEY_FILE);
+  File f(InternalFS);
+  if (!f.open(KEY_FILE, FILE_O_WRITE)) return false;
+  bool ok = f.write((const uint8_t *)&k, sizeof k) == sizeof k;
+  f.close();
+  return ok;
+}
+
+static void newNonce() {
+  if (sd_rand_application_vector_get(nonce, sizeof nonce) != NRF_SUCCESS) {
+    // Random pool empty (rare): stretch the last nonce with the clock instead of reusing it.
+    uint8_t seed[24], out[32];
+    memcpy(seed, nonce, 16);
+    uint32_t t[2] = {micros(), millis()};
+    memcpy(seed + 16, t, 8);
+    GwSha256 h; gw_sha256_init(&h); gw_sha256_update(&h, seed, sizeof seed); gw_sha256_final(&h, out);
+    memcpy(nonce, out, 16);
+  }
+  gwNonce.write(nonce, sizeof nonce);
+}
+
+static void updateInfo() {
+  char b[40];
+  snprintf(b, sizeof b, "%s;l=%d;w=%d;v=%.2f", FW_VERSION, keyOk ? 1 : 0, dfuWindowOpen() ? 1 : 0, lastVdd);
+  gwInfo.write(b);
+}
+
+static bool plainWrite(ble_gatts_evt_write_t *r) {
+  return r->op != BLE_GATTS_OP_PREP_WRITE_REQ && r->op != BLE_GATTS_OP_EXEC_WRITE_REQ_NOW && r->op != BLE_GATTS_OP_EXEC_WRITE_REQ_CANCEL;
+}
+
+static void replyWrite(uint16_t conn, bool ok) {
+  ble_gatts_rw_authorize_reply_params_t reply = {.type = BLE_GATTS_AUTHORIZE_TYPE_WRITE};
+  reply.params.write.gatt_status = ok ? BLE_GATT_STATUS_SUCCESS : BLE_GATT_STATUS_ATTERR_INSUF_AUTHORIZATION;
+  sd_ble_gatts_rw_authorize_reply(conn, &reply);
+}
+
+static void authWriteCb(uint16_t conn, BLECharacteristic *, ble_gatts_evt_write_t *r) {
+  bool ok = false;
+  if (plainWrite(r) && keyOk && r->len == 16) {
+    uint8_t mac[32];
+    gw_hmac_sha256(linkKey, 16, nonce, 16, mac);
+    ok = gw_equal(mac, r->data, 16);
+  }
+  replyWrite(conn, ok);
+  if (ok) authed = true;
+  newNonce();                                        // one guess per nonce
+}
+
+static void keyWriteCb(uint16_t conn, BLECharacteristic *, ble_gatts_evt_write_t *r) {
+  bool ok = plainWrite(r) && r->len == 16 && (dfuWindowOpen() || authed);
+  if (ok) {
+    memcpy(linkKey, r->data, 16);
+    keyOk = true;
+    keyDirty = true;                                 // saved to flash by the main loop, woken right away
+    xSemaphoreGive(wakeSem);
+  }
+  replyWrite(conn, ok);
+  updateInfo();
+}
+
+static void connectCb(uint16_t) { authed = false; newNonce(); updateInfo(); }
+static void disconnectCb(uint16_t, uint8_t) { authed = false; newNonce(); }
+
+static void serviceLink() {
+  if (!keyDirty) return;
+  keyDirty = false;
+  Serial.println(saveKey() ? "Linked to a hub (link key saved)" : "Link key couldn't be saved");
+}
+
+// Same service and behavior as Bluefruit's BLEDfu (legacy DFU, buttonless start), with one change: the start
+// command is only accepted in the window after a reset, or from a connection that authenticated with the link key.
+static const uint8_t UUID_DFU_SVC[16]  = {0x23, 0xD1, 0xBC, 0xEA, 0x5F, 0x78, 0x23, 0x15, 0xDE, 0xEF, 0x12, 0x12, 0x30, 0x15, 0x00, 0x00};
+static const uint8_t UUID_DFU_CTRL[16] = {0x23, 0xD1, 0xBC, 0xEA, 0x5F, 0x78, 0x23, 0x15, 0xDE, 0xEF, 0x12, 0x12, 0x31, 0x15, 0x00, 0x00};
+static const uint8_t UUID_DFU_PKT[16]  = {0x23, 0xD1, 0xBC, 0xEA, 0x5F, 0x78, 0x23, 0x15, 0xDE, 0xEF, 0x12, 0x12, 0x32, 0x15, 0x00, 0x00};
+static const uint8_t UUID_DFU_REV[16]  = {0x23, 0xD1, 0xBC, 0xEA, 0x5F, 0x78, 0x23, 0x15, 0xDE, 0xEF, 0x12, 0x12, 0x34, 0x15, 0x00, 0x00};
+extern "C" void bootloader_util_app_start(uint32_t start_addr);
+BLEService dfuSvc(UUID_DFU_SVC);
+BLECharacteristic dfuCtrl(UUID_DFU_CTRL);
+
+static uint16_t dfuCrc16(const uint8_t *p, uint8_t n) {
+  uint16_t crc = 0xFFFF;
+  while (n--) { uint8_t x = crc >> 8 ^ *p++; x ^= x >> 4; crc = (crc << 8) ^ ((uint16_t)(x << 12)) ^ ((uint16_t)(x << 5)) ^ ((uint16_t)x); }
+  return crc;
+}
+
+static void dfuCtrlCb(uint16_t conn_hdl, BLECharacteristic *chr, ble_gatts_evt_write_t *request) {
+  if (request->handle != chr->handles().value_handle || !plainWrite(request)) return;
+  BLEConnection *conn = Bluefruit.Connection(conn_hdl);
+  ble_gatts_rw_authorize_reply_params_t reply = {.type = BLE_GATTS_AUTHORIZE_TYPE_WRITE};
+  if (!(dfuWindowOpen() || authed)) {
+    reply.params.write.gatt_status = BLE_GATT_STATUS_ATTERR_INSUF_AUTHORIZATION;
+    sd_ble_gatts_rw_authorize_reply(conn_hdl, &reply);
+    return;
+  }
+  if (!chr->notifyEnabled(conn_hdl)) {
+    reply.params.write.gatt_status = BLE_GATT_STATUS_ATTERR_CPS_CCCD_CONFIG_ERROR;
+    sd_ble_gatts_rw_authorize_reply(conn_hdl, &reply);
+    return;
+  }
+  reply.params.write.gatt_status = BLE_GATT_STATUS_SUCCESS;
+  sd_ble_gatts_rw_authorize_reply(conn_hdl, &reply);
+  if (request->data[0] != 1) return;                 // 1 = START DFU
+
+  // Hand the connection data to the bootloader (at 0x20007F80) so it keeps the same address and the client
+  // can reconnect. (The hub links and updates in separate connections, so a new link key is already saved.)
+  typedef struct { ble_gap_addr_t addr; ble_gap_irk_t irk; ble_gap_enc_key_t enc_key; uint8_t sys_attr[8]; uint16_t crc16; } peer_data_t;
+  static_assert(offsetof(peer_data_t, crc16) == 60, "bootloader peer data layout");
+  peer_data_t *peer = (peer_data_t *)(0x20007F80UL);
+  varclr(peer);
+  uint16_t sysattr_len = sizeof(peer->sys_attr);
+  sd_ble_gatts_sys_attr_get(conn_hdl, peer->sys_attr, &sysattr_len, BLE_GATTS_SYS_ATTR_FLAG_SYS_SRVCS);
+  peer->addr = conn->getPeerAddr();
+  if (conn->secured()) {
+    bond_keys_t bkeys;
+    if (conn->loadBondKey(&bkeys)) { peer->addr = bkeys.peer_id.id_addr_info; peer->irk = bkeys.peer_id.id_info; peer->enc_key = bkeys.own_enc; }
+  }
+  peer->crc16 = dfuCrc16((uint8_t *)peer, offsetof(peer_data_t, crc16));
+  Bluefruit.Advertising.restartOnDisconnect(false);
+  conn->disconnect();
+  sd_power_gpregret_clr(0, 0xFF);
+  if (sd_power_gpregret_set(0, 0xB1) != NRF_SUCCESS) return;   // 0xB1 = DFU over the air
+  if (sd_softdevice_disable() != NRF_SUCCESS) return;
+  NVIC->ICER[0] = 0xFFFFFFFF; NVIC->ICPR[0] = 0xFFFFFFFF;
+#if defined(__NRF_NVIC_ISER_COUNT) && __NRF_NVIC_ISER_COUNT == 2
+  NVIC->ICER[1] = 0xFFFFFFFF; NVIC->ICPR[1] = 0xFFFFFFFF;
+#endif
+  if (sd_softdevice_vector_table_base_set(NRF_UICR->NRFFW[0]) != NRF_SUCCESS) return;
+  __set_CONTROL(0);
+  bootloader_util_app_start(NRF_UICR->NRFFW[0]);
+}
+
+static void beginLinkServices() {
+  gwSvc.begin();
+  gwInfo.setProperties(CHR_PROPS_READ);   gwInfo.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);  gwInfo.setMaxLen(40); gwInfo.begin();
+  gwNonce.setProperties(CHR_PROPS_READ);  gwNonce.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS); gwNonce.setFixedLen(16); gwNonce.begin();
+  gwAuth.setProperties(CHR_PROPS_WRITE);  gwAuth.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);  gwAuth.setFixedLen(16);
+  gwAuth.setWriteAuthorizeCallback(authWriteCb); gwAuth.begin();
+  gwKey.setProperties(CHR_PROPS_WRITE);   gwKey.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);   gwKey.setFixedLen(16);
+  gwKey.setWriteAuthorizeCallback(keyWriteCb); gwKey.begin();
+
+  dfuSvc.begin();
+  BLECharacteristic pkt(UUID_DFU_PKT);
+  pkt.setTempMemory(); pkt.setProperties(CHR_PROPS_WRITE_WO_RESP); pkt.setMaxLen(20); pkt.begin();
+  dfuCtrl.setProperties(CHR_PROPS_WRITE | CHR_PROPS_NOTIFY); dfuCtrl.setMaxLen(23);
+  dfuCtrl.setWriteAuthorizeCallback(dfuCtrlCb); dfuCtrl.begin();
+  BLECharacteristic rev(UUID_DFU_REV);
+  rev.setTempMemory(); rev.setProperties(CHR_PROPS_READ); rev.setFixedLen(2); rev.begin(); rev.write16(0x0001);   // "application mode"
+
+  Bluefruit.Periph.setConnectCallback(connectCb);
+  Bluefruit.Periph.setDisconnectCallback(disconnectCb);
+  newNonce();
+  updateInfo();
+}
+
 static void advertise(const uint8_t *svc, uint8_t len) {
-  // In the update window (and not already connected), advertise continuously and accept a connection,
-  // with the name "GW" in the scan response. Otherwise: a non-connectable burst, then the radio sleeps.
-  bool connectable = dfuWindowOpen() && Bluefruit.connected() == 0;
+  // Every burst accepts a connection (v0.10), so the hub can check and update the node; what a connection
+  // may do is decided by the link key and the window after a reset. In that window the node advertises
+  // continuously, for phones. While connected, the reading still goes out as a non-connectable burst.
+  updateInfo();
+  bool connectable = Bluefruit.connected() == 0;
+  bool continuous = connectable && dfuWindowOpen();
   Bluefruit.Advertising.stop();
   Bluefruit.Advertising.clearData();
   Bluefruit.ScanResponse.clearData();
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addData(BLE_GAP_AD_TYPE_SERVICE_DATA, svc, len);
-  if (connectable) Bluefruit.ScanResponse.addName();
+  if (connectable) Bluefruit.ScanResponse.addName();    // "GW"
+
   Bluefruit.Advertising.setType(connectable ? BLE_GAP_ADV_TYPE_CONNECTABLE_SCANNABLE_UNDIRECTED
                                             : BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED);
   Bluefruit.Advertising.setInterval(ADV_INTERVAL_MS * 1000 / 625, ADV_INTERVAL_MS * 1000 / 625);
   Bluefruit.Advertising.restartOnDisconnect(false);
-  Bluefruit.Advertising.start(connectable ? 0 : ADV_BURST_S);   // 0 = until the next reading replaces it
+  Bluefruit.Advertising.start(continuous ? 0 : ADV_BURST_S);    // 0 = until the next reading replaces it
 }
 
 void setup() {
@@ -694,7 +899,9 @@ void setup() {
   Bluefruit.autoConnLed(false);
   Bluefruit.setTxPower(TX_POWER_DBM);
   Bluefruit.setName("GW");
-  bledfu.begin();
+  wakeSem = xSemaphoreCreateBinary();
+  loadKey();
+  beginLinkServices();
   bledis.setManufacturer("GROUNDWELL");
   bledis.setModel("Sensor node");
   bledis.setSoftwareRev(FW_VERSION);                 // firmware revision stays the bootloader's (update apps read it)
@@ -703,6 +910,7 @@ void setup() {
   ble_gap_addr_t addr = Bluefruit.getAddr();
   Serial.printf("GROUNDWELL node fw %s  address %02X:%02X:%02X:%02X:%02X:%02X\n", FW_VERSION,
                 addr.addr[5], addr.addr[4], addr.addr[3], addr.addr[2], addr.addr[1], addr.addr[0]);
+  Serial.printf("Hub link: %s\n", keyOk ? "linked" : "not linked yet (a hub links it within 10 minutes of a reset)");
   if (DFU_WINDOW_MS) Serial.printf("Bluetooth updates open for %lu min: nRF Connect > \"GW\" > DFU\n", (unsigned long)(DFU_WINDOW_MS / 60000));
   if (calOk) Serial.printf("Factory calibration: air %u, water %u (sending moisture %%)\n", cal.air, cal.water);
   else       Serial.println("No factory calibration yet (sending the raw capacitive count). Send CAL AIR, then CAL WATER.");
@@ -715,6 +923,7 @@ void loop() {
   uint16_t cap  = readCapacitive();
   uint16_t rods = readRods();
   float vdd     = readVDD();
+  lastVdd       = vdd;
   float tempC = 0, rh = 0;
   bool airRead  = readAir(tempC, rh);
   static AirFilter airF = {false, false, 0, 0, 0, 0};
@@ -753,8 +962,10 @@ void loop() {
   if ((int32_t)(millis() - nextAt) >= 0) nextAt = millis() + every;       // fell behind (a 10 s calibration, say)
   while ((int32_t)(nextAt - millis()) > 0) {
     serviceSerial();
+    serviceLink();
     uint32_t left = nextAt - millis();
     if ((int32_t)left <= 0) break;
-    delay(Serial ? (left > 50 ? 50 : left) : left);  // FreeRTOS delay: the CPU sleeps here
+    uint32_t wait = Serial ? (left > 50 ? 50 : left) : left;
+    xSemaphoreTake(wakeSem, pdMS_TO_TICKS(wait));    // the CPU sleeps here; a link-key write wakes it early
   }
 }

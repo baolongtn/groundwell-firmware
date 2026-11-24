@@ -149,7 +149,7 @@ function update(d){
     q('.raw').textContent=s.fcal?'probe '+(s.raw/100).toFixed(1)+'%':'raw '+s.raw;q('.kind').textContent=s.fcal?'Capacitive probe, factory calibrated':s.kind+' probe';
     q('.unit-l').textContent=s.fcal?'probe %':'raw';
     q('.air').textContent=(s.air?'Air '+(s.temp*9/5+32).toFixed(1)+' °F ('+s.temp+' °C) · '+s.rh+'% RH':'Air: no reading')+(s.luxOk?' · Light '+Number(s.lux).toLocaleString()+' lux':'')+(s.uv!=null?' · UV '+s.uv:'');
-    q('.link').textContent='Node '+s.node.slice(-5)+' · '+s.volt+' V · '+s.brssi+' dBm · '+s.loss+'% lost · '+ago(s.ageS);
+    q('.link').textContent='Node '+s.node.slice(-5)+' · '+s.volt+' V · '+s.brssi+' dBm · '+s.loss+'% lost · '+ago(s.ageS)+(s.nst?' · '+s.nst:(s.nfw?' · firmware '+s.nfw:''));
     const open=q('details').open;
     const sc=s.fcal?100:1;
     [['.i-dry',s.dry/sc],['.i-wet',s.wet/sc],['.i-thr',s.thr]].forEach(([k,v])=>{const e=q(k);if(!open||e.value==='')e.value=v});
