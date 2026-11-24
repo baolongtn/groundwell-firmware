@@ -8,7 +8,7 @@
   LTR390 / VEML7700 / GL5539 light, LTR390 UV                                                air + light history, once a minute
 ```
 
-**Versions:** node firmware v0.9.0, hub firmware v0.9.0, cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
+**Versions:** node firmware v0.9.1, hub firmware v0.9.1 (both can now be updated over the air, section 6), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
 
 **New in v0.9**
 - **Battery profile, on USB or battery alike.** The node reads every 30 s instead of 5 s, broadcasts each reading in a 6 s burst and then turns the radio off, and keeps every sensor powered down or in standby between readings. The CPU already slept between readings.
@@ -211,17 +211,19 @@ npx wrangler deploy                                      # prints https://ground
 
 ## 4. Flash the hub
 
-1. **Create `secrets.h`:** copy `hub/GroundwellHub/secrets.example.h` to `secrets.h` in the same folder and fill in:
-   - `WIFI_SSID` and `WIFI_PASS`
-   - `CLOUD_URL` = `https://groundwell.<your-subdomain>.workers.dev/api/ingest`
-   - `INGEST_KEY` = the same string you gave Cloudflare
+The first v0.9.1 flash goes over USB. After that, updates go over Wi-Fi (section 6).
 
-   `secrets.h` is git-ignored, so these never reach GitHub. Then check the settings block at the top of `GroundwellHub.ino`:
+1. **Board package:** "esp32 by Espressif Systems" **3.x** in Boards Manager. Don't move to 4.0: it replaced the Bluetooth library the hub uses, and the sketch won't compile on it.
+2. **Optional `secrets.h`:** copy `hub/GroundwellHub/secrets.example.h` to `secrets.h` in the same folder and fill in `WIFI_SSID`, `WIFI_PASS`, `CLOUD_URL` (`https://groundwell.<your-subdomain>.workers.dev/api/ingest`) and `INGEST_KEY` (the string you gave Cloudflare). The hub then joins your Wi-Fi straight away. Without it, the hub opens its setup hotspot (step 5). `secrets.h` is git-ignored.
+3. **Check the settings block** at the top of `GroundwellHub.ino`:
    - `USE_EXTERNAL_ANTENNA 1` if you plug in a U.FL antenna; it helps both Wi-Fi and Bluetooth range
    - `ADMIN_PIN`: leave `""` to let anyone on your Wi-Fi open the Admin view, or set digits to require a PIN for it and for calibration changes
    - `SOIL_DRY_PS` / `SOIL_WET_PS`: where bone-dry and freshly drained potting mix land on the probe scale. The defaults (30 and 75) are starting values from typical capacitive-probe data. Replace them with your own lab numbers: a few factory-calibrated probes in your potting mix, bone-dry and then watered and drained, checked on a kitchen scale (design doc test 6).
-2. **Select the board:** XIAO_ESP32C6, with Tools > Partition Scheme set to **Huge APP (3MB No OTA)**. Bluetooth, Wi-Fi and HTTPS together don't fit the default partition. If Huge APP isn't listed, pick any scheme with an app partition of 2 MB or more.
-3. **Upload,** then open Serial Monitor (115200). Every 10 s it prints the hub IP, each probe's value and each node's measured interval (`node 1F:C1 every 5.0 s`), and every 30 s an `Upload N readings -> HTTP 200` line.
+4. **Select the board** XIAO_ESP32C6 and **Upload**. Any Partition Scheme works: `partitions.csv` in the sketch folder replaces it with two 1.875 MB app slots. The IDE still prints the menu's limit ("Maximum is 3145728 bytes"); the real limit is 1,966,080 bytes, which the GitHub build checks. Names and calibration already on the hub survive the switch.
+   - **No Arduino IDE?** Download the build from GitHub (repo > Actions > latest run > Artifacts) and flash `GroundwellHub.ino.merged.bin` at address 0 with Espressif's web flasher in Chrome.
+5. **Settings:** open Serial Monitor (115200). With `secrets.h`, it prints the hub IP. Without it, it prints `Setup hotspot open`: on your phone, join **groundwell-setup-XXXX** (password `groundwell`) and the setup page opens (or browse to `http://192.168.4.1/setup`). Enter your Wi-Fi, the cloud URL, the ingest key and an **update password**, then Save.
+   - Either way, set the **update password** once at `http://plants.local/setup`. Firmware updates stay off until you do.
+   - Every 10 s Serial Monitor prints each probe's value and each node's interval, and every minute an `Upload N readings -> HTTP 200` line.
 
 ## 5. Use it
 
@@ -301,6 +303,33 @@ The live service also counts index updates as writes, so allow up to about 1.5 t
 
 The hourly scoring reads hourly roll-ups only: about 5,000 rows per pot per run, or about 1 million rows a day for 8 pots. That's well under the free plan's 5 million rows read per day.
 
+## 6. Update over the air
+
+Firmware files come from the GitHub build: every push to `groundwell-firmware` builds both boards. Open the repo > **Actions** > latest run > **Artifacts**, and unzip it.
+
+| File | What it's for |
+|---|---|
+| `GroundwellHub.ino.bin` | Hub update over Wi-Fi (`/update`) |
+| `GroundwellHub.ino.merged.bin` | Hub first flash over USB with the web flasher (address 0) |
+| `GroundwellHub-crashtest.bin` | Rollback test: a hub build that crashes 20 s after every boot |
+| `GroundwellNode.ino.zip` | Node update over Bluetooth (nRF Connect) |
+| `GroundwellNode.uf2` | Node flash over USB without Arduino IDE: double-tap reset, drag onto the XIAO drive |
+
+### Hub
+
+- **From a browser:** `http://plants.local/update` (user `admin`, your update password). Pick `GroundwellHub.ino.bin` and upload; it takes under a minute, then the hub restarts into it.
+- **From Arduino IDE:** the hub shows up under Tools > Port as a network port (`plants at 192.168.x.x`). Upload as usual; the IDE asks for the update password.
+- **Trial and rollback:** a new firmware runs on trial. If it crashes (or hangs for 60 s) 3 times before it has run 10 minutes, heard a node and had a cloud upload accepted, the hub goes back to the previous firmware on its own. `/update` shows how the last update went. Power cuts and the hub's own restarts don't count as crashes.
+- **Rollback test (worth doing once):** upload `GroundwellHub-crashtest.bin`. It boots, crashes 20 s later, three times, and about a minute and a half later the hub is back on 0.9.1 with a note on `/update`.
+- **What gets rejected:** the merged file, node files and other chips' firmware are refused before anything is written. A dropped upload changes nothing.
+- **Settings later:** `http://plants.local/setup` (same password). Or hold the **BOOT** button for 3 s: the setup hotspot opens for 15 minutes, which is the way back in if you change routers or forget the password. If the saved Wi-Fi isn't found within 3 minutes of power-up, the hotspot opens on its own and closes once Wi-Fi is back.
+
+### Nodes
+
+- For **10 minutes after power-up or a reset**, a node accepts Bluetooth connections. After that it goes back to short broadcasts that nobody can connect to.
+- **To update:** press the node's reset button once (twice puts it into USB mode instead). On your phone, open **nRF Connect for Mobile**, connect to **GW**, tap **DFU**, and pick `GroundwellNode.ino.zip`. It takes about a minute; the node then restarts on the new firmware with its factory calibration intact.
+- There is no automatic rollback on the node. If an update is interrupted, the node waits in its bootloader; run the update again, or flash the `.uf2` over USB.
+
 ## Verified before release
 
 - **v0.9 node firmware:** compiles cleanly against stub headers in both wiring modes (the Seeed nRF52 core couldn't be downloaded for a full build; compile it in Arduino IDE before flashing). `tools/sensor_math_test.cpp` checks the CRC against Sensirion's worked example, the SHT4x and AHT20 conversions, LTR390 scaling, and the glitch filter (one-off spikes dropped, real changes kept). All pass.
@@ -348,7 +377,8 @@ The hourly scoring reads hourly roll-ups only: about 5,000 rows per pot per run,
 
 - **Server identity isn't verified yet.** The hub's connection to Cloudflare is encrypted, but `setInsecure()` means it doesn't check the server's certificate. Before shipping to anyone else, pin the certificate authority.
 - **Calibration source:** "Set dry/wet = now" uses the latest reading the hub received, up to 5 s old. Wait for one update after moving a probe.
-- **Wi-Fi password:** it's compiled into the hub firmware. A product needs Bluetooth or hotspot-based Wi-Fi setup instead.
+- **Setup hotspot password:** every hub uses the same default (`SETUP_AP_PASS`). A product needs one per unit, printed on its label.
+- **Updates aren't signed yet.** The hub's `/update` and Arduino IDE uploads need the update password, and a node only accepts an update in the 10 minutes after a reset, but neither checks who built the file. Next steps: the hub pulls signed builds from Cloudflare, then passes node updates on over Bluetooth.
 - **The diagnoses are heuristics, not lab tests.** They're built on standard plant physics (transpiration driven by VPD and light) and tested against a simulator, not yet against real failing plants. Treat "root rot risk" as "go look at the roots".
 - **Lux is not plant light.** The conversion assumes daylight. Under white LED grow lights, the light score reads about 20% high.
 - **Photoresistors can't go in a product sold in the EU.** They contain cadmium sulfide, which RoHS restricts. The product node should use a silicon sensor: the sketch's VEML7700 mode, or an analog phototransistor such as the ALS-PT19 in the same divider with a new resistor value. The photoresistor also reads purple grow lights poorly.

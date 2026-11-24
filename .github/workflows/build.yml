@@ -39,7 +39,7 @@ jobs:
           # No secrets.h in CI: the hub opens its setup hotspot on first boot.
           mkdir -p build
           # partitions.csv in the sketch folder gives two 1,966,080-byte app slots; fail the build if the hub outgrows one.
-          arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6 --build-property upload.maximum_size=1966080 \
+          arduino-cli compile --warnings default --fqbn esp32:esp32:XIAO_ESP32C6 --build-property upload.maximum_size=1966080 \
             --output-dir build/hub hub/GroundwellHub 2>&1 | tee build/hub.log
           test -f build/hub/GroundwellHub.ino.bin
           grep -qa app1 build/hub/GroundwellHub.ino.partitions.bin   # the two-slot table made it into the build
@@ -54,7 +54,7 @@ jobs:
       - name: Build node (XIAO nRF52840)
         run: |
           mkdir -p build
-          arduino-cli compile --fqbn Seeeduino:nrf52:xiaonRF52840 \
+          arduino-cli compile --warnings default --fqbn Seeeduino:nrf52:xiaonRF52840 \
             --output-dir build/node node/GroundwellNode 2>&1 | tee build/node.log
           test -f build/node/GroundwellNode.ino.hex
           # UF2 for drag-and-drop flashing: double-tap reset, copy the file onto the XIAO drive.
