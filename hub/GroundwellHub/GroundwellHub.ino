@@ -1,7 +1,20 @@
 /*
-  GROUNDWELL hub v0.9.0
-  Board: Seeed XIAO ESP32-C6, Arduino core "esp32 by Espressif Systems" 3.x, board "XIAO_ESP32C6"
-         Tools > Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)"  (Wi-Fi + BLE + TLS is a big binary)
+  GROUNDWELL hub v0.9.1
+  Board: Seeed XIAO ESP32-C6, Arduino core "esp32 by Espressif Systems" 3.x (NOT 4.x: it replaced the BLE API),
+         board "XIAO_ESP32C6". Any Partition Scheme: partitions.csv in this folder overrides it with two
+         1.875 MB app slots for over-the-air updates. (The IDE still prints the menu's size limit; the real
+         limit is 1,966,080 bytes, and the GitHub build checks it.)
+
+  Updates over the air (v0.9.1)
+    - http://plants.local/update : upload GroundwellHub.ino.bin (user "admin", the update password).
+    - Arduino IDE: the hub shows up under Tools > Port as a network port; upload as usual.
+    - A new firmware runs on trial. If it crashes 3 times before it proves itself (Wi-Fi up, a node heard,
+      a cloud upload accepted, 10 minutes running), the hub goes back to the previous firmware on its own.
+  Setup page (v0.9.1)
+    - Wi-Fi, cloud URL, ingest key and the update password live in the hub's own memory, set on /setup.
+    - No Wi-Fi saved, or none found within 3 minutes of power-up, or the BOOT button held for 3 s:
+      the hub opens its own hotspot "groundwell-setup-XXXX" (password SETUP_AP_PASS) with the setup page.
+    - secrets.h is optional: if present, it fills in an empty hub (or one whose secrets.h changed) on boot.
 
   What it does
     - Listens for BTHome v2 broadcasts from GROUNDWELL nodes (or any BTHome device with "count" objects).
@@ -20,7 +33,8 @@
     - Probe names and calibration set on the cloud dashboard (Admin > Calibrate) come back in the
       upload reply and are applied and saved here, as if set on this page (v0.6.2).
 
-  Copy secrets.example.h to secrets.h and fill it in, check the settings block, flash, then open Serial Monitor at 115200 for the IP address.
+  First flash over USB. Optional: copy secrets.example.h to secrets.h and fill it in, so the hub joins
+  your Wi-Fi straight away. Then open Serial Monitor at 115200 for the IP address.
 */
 
 #include <WiFi.h>
@@ -32,18 +46,48 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <Update.h>
+#include <ArduinoOTA.h>
+#include <DNSServer.h>
+#include <esp_ota_ops.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
 #include <time.h>
 #include "bthome.h"
 #include "page.h"
 
 // ======================= settings =======================
-// Wi-Fi and cloud credentials (WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY) live in secrets.h:
-// copy secrets.example.h to secrets.h in this folder and fill it in. secrets.h is git-ignored.
+#ifndef GW_CRASH_TEST
+  #define GW_CRASH_TEST 0      // 1 = rollback test build: crashes 20 s after every boot (the GitHub build makes one)
+#endif
+#if GW_CRASH_TEST
+  #define GW_FW_VERSION "0.9.1-crashtest"
+#else
+  #define GW_FW_VERSION "0.9.1"
+#endif
+static const char *FW_VERSION = GW_FW_VERSION;
+// Optional secrets.h (git-ignored): WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY and optionally OTA_PASS.
+// It only seeds the hub's memory; after that the setup page is where settings change.
 #if __has_include("secrets.h")
   #include "secrets.h"
-#else
-  #error "Missing secrets.h: copy secrets.example.h to secrets.h in the GroundwellHub folder and fill it in."
 #endif
+#ifndef WIFI_SSID
+  #define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASS
+  #define WIFI_PASS ""
+#endif
+#ifndef CLOUD_URL
+  #define CLOUD_URL ""
+#endif
+#ifndef INGEST_KEY
+  #define INGEST_KEY ""
+#endif
+#ifndef OTA_PASS
+  #define OTA_PASS ""
+#endif
+#define DEFAULT_CLOUD_URL "https://groundwell.groundwell.workers.dev/api/ingest"   // pre-filled on the setup page
+#define SETUP_AP_PASS "groundwell"              // setup hotspot password (8+ characters). A product needs one per unit, on its label.
 #define HOSTNAME    "plants"
 #define HUB_ID      "home"                      // name of this hub in the cloud
 #define USE_EXTERNAL_ANTENNA 0                  // 1 if a U.FL antenna is plugged into the XIAO
@@ -62,6 +106,12 @@ static const uint32_t STALE_MS         = 150000; // card shows "no signal" after
 static const uint32_t CLIMATE_MS       = 60000; // air temp/humidity and light sent to the cloud once a minute per node
 static const uint32_t WIFI_RETRY_MS    = 30000; // Wi-Fi down this long: start the connection over (rescans, picks any mesh point)
 static const uint32_t WIFI_REBOOT_MS   = 30UL * 60 * 1000;   // still down after this: restart the hub, once per outage
+static const uint32_t SETUP_AFTER_MS   = 3UL * 60 * 1000;    // no Wi-Fi this long after power-up: open the setup hotspot too
+static const uint32_t SETUP_OPEN_MS    = 15UL * 60 * 1000;   // hotspot opened with the BOOT button stays this long
+static const uint32_t TRIAL_MIN_MS     = 10UL * 60 * 1000;   // a new firmware must run this long (plus the checks) to be kept
+static const uint8_t  TRIAL_CRASHES    = 3;                  // crashes on trial before going back to the previous firmware
+static const uint32_t WATCHDOG_MS      = 60000;              // the main loop must come round within this, or the hub resets
+static const int      SETUP_BTN_PIN    = BOOT_PIN;           // the BOOT button (GPIO 9 on the ESP32-C6)
 // ========================================================
 
 static const int MAX_NODES = 8, MAX_SENSORS = 16, LIVE_LEN = 720, DAY_LEN = 288, QUEUE_LEN = 3000, CLIM_LEN = 600, LIGHT_LEN = 600;
@@ -143,6 +193,15 @@ WebServer server(80);
 Preferences prefs;
 BLEScan *scan;
 
+// Settings in the hub's own memory (namespace "gwcfg"): set on /setup, or seeded from secrets.h.
+struct Config { String ssid, pass, url, key, otapw; } cfg;
+Preferences cfgPrefs, otaPrefs;
+DNSServer dns;
+bool apOn = false, everConnected = false, otaBusy = false, arduinoOtaUp = false, staPaused = false;
+uint32_t apCloseAt = 0, apIdleSince = 0;     // apCloseAt 0 = no BOOT-button window
+volatile uint32_t advTotal = 0;              // BTHome packets heard since boot (one of the trial checks)
+bool trialActive = false;                    // this firmware is new and hasn't passed its trial yet
+
 // ---------------- helpers ----------------
 static int clampPct(long p) { return p < 0 ? 0 : (p > 100 ? 100 : (int)p); }
 
@@ -223,6 +282,7 @@ static void enqueue(uint8_t node, uint8_t ch, uint16_t raw) {
 static void handlePacket(const char *mac, int rssi, const BTHomePacket &p) {
   if (p.nCounts == 0 && !p.hasMoist) return;
   advHeard++;
+  advTotal++;
   xSemaphoreTake(lock, portMAX_DELAY);
   int ni = findNode(mac, true);
   if (ni >= 0) {
@@ -331,7 +391,7 @@ static void pushDay() {
 static void applyCloudCfg(const String &resp);
 
 static void uploadBatch() {
-  if (strlen(CLOUD_URL) == 0 || WiFi.status() != WL_CONNECTED) return;
+  if (otaBusy || cfg.url.length() == 0 || WiFi.status() != WL_CONNECTED) return;
 
   // Snapshot up to 240 readings plus the sensor names/calibration, then release the lock.
   String body;
@@ -415,9 +475,9 @@ static void uploadBatch() {
     http.setTimeout(10000);
     http.setConnectTimeout(10000);
     http.setReuse(false);
-    if (http.begin(tls, CLOUD_URL)) {
+    if (http.begin(tls, cfg.url)) {
       http.addHeader("Content-Type", "application/json");
-      http.addHeader("Authorization", String("Bearer ") + INGEST_KEY);
+      http.addHeader("Authorization", String("Bearer ") + cfg.key);
       code = http.POST(body);
       if (code < 0) tls.lastError(tlsErr, sizeof(tlsErr));
       else if (code == 200) reply = http.getString();   // may carry calibration from the cloud dashboard
@@ -451,7 +511,10 @@ static void uploadBatch() {
 }
 
 // ---------------- web ----------------
-static void handleRoot() { server.send_P(200, "text/html", PAGE); }
+static void handleRoot() {
+  if (!cfg.ssid.length()) { server.sendHeader("Location", "/setup"); server.send(302, "text/plain", ""); return; }
+  server.send_P(200, "text/html", PAGE);
+}
 
 static void handleLive() {
   String j;
@@ -459,10 +522,12 @@ static void handleLive() {
   uint32_t now = millis();
   xSemaphoreTake(lock, portMAX_DELAY);
   j += "{\"uptime\":"; j += now / 1000;
+  j += ",\"fw\":\""; j += FW_VERSION; j += '"';
+  j += ",\"trial\":"; j += trialActive ? "true" : "false";
   j += ",\"pin\":"; j += strlen(ADMIN_PIN) ? "true" : "false";
   j += ",\"rssi\":"; j += (int)WiFi.RSSI();
   j += ",\"ip\":\""; j += WiFi.localIP().toString();
-  j += "\",\"cloud\":{\"enabled\":"; j += strlen(CLOUD_URL) ? "true" : "false";
+  j += "\",\"cloud\":{\"enabled\":"; j += cfg.url.length() ? "true" : "false";
   j += ",\"code\":"; j += lastUploadCode;
   j += ",\"ageS\":"; j += lastUploadOk ? (long)((now - lastUploadOk) / 1000) : -1L;
   j += ",\"queued\":"; j += qCount;
@@ -626,13 +691,304 @@ static void handleConfig() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
+// ---------------- settings in the hub's memory ----------------
+static uint32_t fnv1a(const char *s, uint32_t h) { while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; } return h; }
+
+static void loadConfig() {
+  cfgPrefs.begin("gwcfg", false);
+  // secrets.h fills in an empty hub, and replaces the saved values only when secrets.h itself changed,
+  // so settings changed on /setup stick until you edit secrets.h and flash again.
+  if (strlen(WIFI_SSID)) {
+    const char *f[] = {WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY, OTA_PASS};
+    uint32_t h = 2166136261u;
+    for (const char *s : f) { h = fnv1a(s, h); h = fnv1a("\x1f", h); }
+    if (cfgPrefs.getULong("seed", 0) != h) {
+      cfgPrefs.putString("ssid", WIFI_SSID);
+      cfgPrefs.putString("pass", WIFI_PASS);
+      cfgPrefs.putString("url", CLOUD_URL);
+      cfgPrefs.putString("key", INGEST_KEY);
+      if (strlen(OTA_PASS) >= 8) cfgPrefs.putString("otapw", OTA_PASS);
+      cfgPrefs.putULong("seed", h);
+      Serial.println("Settings filled in from secrets.h");
+    }
+  }
+  cfg.ssid  = cfgPrefs.getString("ssid", "");
+  cfg.pass  = cfgPrefs.getString("pass", "");
+  cfg.url   = cfgPrefs.getString("url", "");
+  cfg.key   = cfgPrefs.getString("key", "");
+  cfg.otapw = cfgPrefs.getString("otapw", "");
+}
+
+// ---------------- setup hotspot ----------------
+static String apName() { String m = WiFi.macAddress(); m.replace(":", ""); return "groundwell-setup-" + m.substring(8); }
+
+static void openSetup(uint32_t forMs, const char *why) {
+  if (!apOn) {
+    WiFi.softAP(apName().c_str(), SETUP_AP_PASS);
+    dns.start(53, "*", WiFi.softAPIP());          // every name points at the hub, so phones show the setup page
+    apOn = true;
+    Serial.printf("Setup hotspot open (%s): join \"%s\" (password \"%s\"), then open http://%s/setup\n",
+                  why, apName().c_str(), SETUP_AP_PASS, WiFi.softAPIP().toString().c_str());
+  }
+  apIdleSince = 0;
+  if (forMs) apCloseAt = (millis() + forMs) | 1;
+}
+
+static void closeSetup() {
+  if (!apOn) return;
+  dns.stop();
+  WiFi.softAPdisconnect(true);
+  apOn = false;
+  apCloseAt = 0;
+  Serial.println("Setup hotspot closed");
+}
+
+static bool fromHotspot() { return apOn && server.client().localIP() == WiFi.softAPIP(); }
+
+// ---------------- firmware trial and rollback ----------------
+// A new firmware runs on trial. Each crash (panic or watchdog) on trial counts; after TRIAL_CRASHES the hub
+// switches back to the other slot, which still holds the previous firmware. Power cuts, brownouts and the
+// hub's own restarts don't count. The trial ends once the new firmware has proven itself (trialMaybeConfirm).
+static const char *slotName() { const esp_partition_t *p = esp_ota_get_running_partition(); return p ? p->label : "?"; }
+
+static void trialStart() {   // called after a new firmware is written, just before restarting into it
+  otaPrefs.putBool("trial", true);
+  otaPrefs.putUChar("crashes", 0);
+  otaPrefs.putString("prev", slotName());
+  otaPrefs.putString("prevVer", FW_VERSION);
+}
+
+static void trialCheckAtBoot() {
+  otaPrefs.begin("gwota", false);
+  if (!otaPrefs.getBool("trial", false)) return;
+  if (otaPrefs.getString("prev", "") == slotName()) {   // the new firmware never started; the old one is still running
+    otaPrefs.putBool("trial", false);
+    otaPrefs.putString("note", String("The last update didn't start, so the hub kept ") + FW_VERSION + ".");
+    return;
+  }
+  esp_reset_reason_t r = esp_reset_reason();
+  bool crash = r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
+  uint8_t crashes = otaPrefs.getUChar("crashes", 0) + (crash ? 1 : 0);
+  otaPrefs.putUChar("crashes", crashes);
+  if (crash) Serial.printf("Firmware %s on trial: crash %u of %u (reset reason %d)\n", FW_VERSION, crashes, TRIAL_CRASHES, (int)r);
+  if (crashes >= TRIAL_CRASHES) {
+    String back = otaPrefs.getString("prevVer", "the previous firmware");
+    otaPrefs.putBool("trial", false);
+    if (Update.rollBack()) {
+      otaPrefs.putString("note", String("Firmware ") + FW_VERSION + " crashed " + crashes + " times on trial, so the hub went back to " + back + ".");
+      Serial.printf("Going back to firmware %s\n", back.c_str());
+      delay(200);
+      ESP.restart();
+    }
+    otaPrefs.putString("note", String("Firmware ") + FW_VERSION + " crashed on trial, and the previous firmware couldn't be restored.");
+    return;
+  }
+  trialActive = true;
+}
+
+static void trialMaybeConfirm() {   // proven: 10 minutes up, on Wi-Fi, a node heard, and a cloud upload accepted (if the cloud is on)
+  if (!trialActive || millis() < TRIAL_MIN_MS) return;
+  if (WiFi.status() != WL_CONNECTED || advTotal == 0) return;
+  if (cfg.url.length() && !lastUploadOk) return;
+  trialActive = false;
+  otaPrefs.putBool("trial", false);
+  otaPrefs.putString("note", String("Firmware ") + FW_VERSION + " passed its trial.");
+  Serial.printf("Firmware %s passed its trial\n", FW_VERSION);
+}
+
+static void startWatchdog() {   // a hang counts as a crash: the loop must come round within WATCHDOG_MS
+  esp_task_wdt_config_t c = {.timeout_ms = WATCHDOG_MS, .idle_core_mask = 0, .trigger_panic = true};
+  if (esp_task_wdt_reconfigure(&c) != ESP_OK) esp_task_wdt_init(&c);
+  enableLoopWDT();
+}
+
+// ---------------- pages: /setup and /update ----------------
+static const char PAGE_HEAD[] PROGMEM =
+  "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+  "<title>groundwell hub</title><style>body{font-family:system-ui,sans-serif;background:#fdf6ee;color:#5a4636;"
+  "max-width:30rem;margin:1.5rem auto;padding:0 1rem}h1{font-size:1.35rem;color:#6f8f5e;font-weight:600}"
+  "label{display:block;margin:.9rem 0 .25rem;font-weight:600}input{width:100%;box-sizing:border-box;padding:.55rem;"
+  "border:1px solid #d9c7b5;border-radius:3px;font-size:1rem;background:#fff}button{margin-top:1.2rem;padding:.6rem 1.2rem;"
+  "background:#6f8f5e;color:#fff;border:0;border-radius:3px;font-size:1rem}.note{font-size:.85rem;color:#8a7461}"
+  ".msg{padding:.6rem .8rem;background:#f3e3d3;border-radius:3px}.err{background:#f6d6cc}a{color:#6f8f5e}"
+  "table{border-collapse:collapse}td{padding:.15rem .8rem .15rem 0}</style></head><body><h1>groundwell hub</h1>";
+
+static String htmlEsc(const String &s) {
+  String o;
+  o.reserve(s.length() + 8);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '&') o += "&amp;"; else if (c == '<') o += "&lt;"; else if (c == '>') o += "&gt;"; else if (c == '"') o += "&quot;"; else o += c;
+  }
+  return o;
+}
+
+static void sendPage(int code, const String &body) {
+  String h = FPSTR(PAGE_HEAD);
+  h += body;
+  h += "<p class=note>Firmware "; h += FW_VERSION; h += " · <a href=/>Dashboard</a> · <a href=/update>Update</a> · <a href=/setup>Settings</a></p></body></html>";
+  server.send(code, "text/html", h);
+}
+
+// On the setup hotspot you're next to the hub: no password. On your Wi-Fi: the update password, once one is set.
+static bool setupAuthOk() {
+  if (fromHotspot() || cfg.otapw.length() == 0) return true;
+  if (server.authenticate("admin", cfg.otapw.c_str())) return true;
+  server.requestAuthentication(BASIC_AUTH, "groundwell hub", "Update password needed (user admin)");
+  return false;
+}
+
+static void handleSetupPage(const String &msg, bool isErr) {
+  String opts;
+  int n = WiFi.scanNetworks(false, false, false, 300);
+  for (int i = 0; i < n && i < 20; i++) { String s = WiFi.SSID(i); if (s.length()) { opts += "<option value=\""; opts += htmlEsc(s); opts += "\">"; } }
+  WiFi.scanDelete();
+  String b;
+  if (msg.length()) { b += "<p class='msg"; b += isErr ? " err" : ""; b += "'>"; b += msg; b += "</p>"; }
+  b += "<form method=post action=/setup>";
+  b += "<label>Wi-Fi network (2.4 GHz)</label><input name=ssid list=nets required maxlength=32 value=\""; b += htmlEsc(cfg.ssid); b += "\"><datalist id=nets>"; b += opts; b += "</datalist>";
+  b += "<label>Wi-Fi password</label><input name=pass type=password maxlength=63 placeholder=\""; b += cfg.pass.length() ? "saved (leave blank to keep)" : ""; b += "\">";
+  b += "<label>Cloud upload URL</label><input name=url value=\""; b += htmlEsc(cfg.url.length() || cfg.ssid.length() ? cfg.url : String(DEFAULT_CLOUD_URL)); b += "\">";
+  b += "<div class=note>Leave empty to turn cloud upload off.</div>";
+  b += "<label>Ingest key</label><input name=key type=password placeholder=\""; b += cfg.key.length() ? "saved (leave blank to keep)" : "the INGEST_KEY you gave Cloudflare"; b += "\">";
+  b += "<label>Update password</label><input name=otapw type=password minlength=8 placeholder=\""; b += cfg.otapw.length() ? "saved (leave blank to keep)" : "choose one, 8+ characters"; b += "\">";
+  b += "<div class=note>Protects firmware updates and this page on your Wi-Fi. User name: admin.</div>";
+  b += "<button>Save and restart</button></form>";
+  sendPage(isErr ? 400 : 200, b);
+}
+
+static void handleSetupGet() { if (setupAuthOk()) handleSetupPage("", false); }
+
+static void handleSetupSave() {
+  if (!setupAuthOk()) return;
+  String ssid = server.arg("ssid"), pass = server.arg("pass"), url = server.arg("url"), key = server.arg("key"), otapw = server.arg("otapw");
+  ssid.trim(); url.trim(); key.trim();
+  if (!ssid.length() || ssid.length() > 32) return handleSetupPage("Enter the Wi-Fi network name (up to 32 characters).", true);
+  if (pass.length() && (pass.length() < 8 || pass.length() > 63)) return handleSetupPage("Wi-Fi passwords are 8 to 63 characters.", true);
+  if (url.length() && !url.startsWith("https://")) return handleSetupPage("The cloud URL must start with https://", true);
+  if (otapw.length() && otapw.length() < 8) return handleSetupPage("The update password needs at least 8 characters.", true);
+  if (!otapw.length() && !cfg.otapw.length()) return handleSetupPage("Choose an update password (8+ characters).", true);
+  cfgPrefs.putString("ssid", ssid);
+  if (pass.length() || ssid != cfg.ssid) cfgPrefs.putString("pass", pass);   // a new network with a blank password = open network
+  cfgPrefs.putString("url", url);
+  if (key.length()) cfgPrefs.putString("key", key);
+  if (otapw.length()) cfgPrefs.putString("otapw", otapw);
+  sendPage(200, "<p class=msg>Saved. The hub is restarting and will join <b>" + htmlEsc(ssid) +
+                "</b>. On that network the dashboard is at <a href=http://" HOSTNAME ".local/>http://" HOSTNAME ".local/</a>.</p>");
+  delay(1500);
+  ESP.restart();
+}
+
+static bool updateAuthOk() {
+  if (server.authenticate("admin", cfg.otapw.c_str())) return true;
+  server.requestAuthentication(BASIC_AUTH, "groundwell hub", "Update password needed (user admin)");
+  return false;
+}
+
+static void handleUpdatePage() {
+  if (!cfg.otapw.length()) { sendPage(200, "<p class=msg>Choose an update password on the <a href=/setup>settings page</a> first.</p>"); return; }
+  if (!updateAuthOk()) return;
+  const esp_partition_t *run = esp_ota_get_running_partition(), *next = esp_ota_get_next_update_partition(NULL);
+  String b = "<table><tr><td>Firmware</td><td><b>"; b += FW_VERSION; b += "</b>"; b += trialActive ? " (on trial)" : ""; b += "</td></tr>";
+  b += "<tr><td>Slot</td><td>"; b += run ? run->label : "?"; b += ", "; b += ESP.getSketchSize() / 1024; b += " of "; b += run ? run->size / 1024 : 0; b += " KB</td></tr></table>";
+  String note = otaPrefs.getString("note", "");
+  if (note.length()) { b += "<p class=msg>"; b += htmlEsc(note); b += "</p>"; }
+  if (!next) {
+    b += "<p class='msg err'>This hub has a single app slot. Flash it over USB once with this firmware's partition table.</p>";
+  } else {
+    b += "<label>New firmware: GroundwellHub.ino.bin</label><input type=file id=f accept=.bin>";
+    b += "<button onclick=go()>Upload and restart</button><p id=s class=note></p>";
+    b += "<script>function go(){const f=document.getElementById('f').files[0],s=document.getElementById('s');if(!f)return;"
+         "const x=new XMLHttpRequest();x.open('POST','/update');"
+         "x.upload.onprogress=e=>{if(e.lengthComputable)s.textContent='Uploading '+Math.round(e.loaded*100/e.total)+'%'};"
+         "x.onload=()=>{s.textContent=x.responseText;if(x.status==200)setTimeout(()=>location.href='/update',25000)};"
+         "x.onerror=()=>{s.textContent='Upload failed: the connection dropped. Nothing was changed.'};"
+         "const d=new FormData();d.append('firmware',f);x.send(d)}</script>";
+    b += "<p class=note>The new firmware runs on trial. If it crashes 3 times before it proves itself, the hub goes back to this one.</p>";
+  }
+  sendPage(200, b);
+}
+
+static bool upAuthed = false;
+static String upErr;
+
+static void handleUpdateUpload() {
+  HTTPUpload &up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    upErr = "";
+    upAuthed = cfg.otapw.length() && server.authenticate("admin", cfg.otapw.c_str());
+    if (!upAuthed) { upErr = "Update password needed."; return; }
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    if (!esp_ota_get_next_update_partition(NULL)) { upErr = "This hub has a single app slot: flash it over USB once."; return; }
+    if (run && ESP.getSketchSize() > run->size) { upErr = "The running firmware is bigger than its slot: flash over USB."; return; }
+    otaBusy = true;
+    scan->stop();                                   // give Wi-Fi the radio while the file comes in
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) upErr = String("Couldn't start: ") + Update.errorString();
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    esp_task_wdt_reset();
+    if (!upAuthed || upErr.length()) return;
+    if (Update.progress() == 0) {                   // first chunk: is this a hub app image?
+      const uint8_t *b = up.buf;
+      bool image = up.currentSize >= 36 && b[0] == 0xE9;
+      bool app = image && b[32] == 0x32 && b[33] == 0x54 && b[34] == 0xCD && b[35] == 0xAB;   // esp_app_desc_t magic
+#ifdef CONFIG_IDF_FIRMWARE_CHIP_ID
+      bool chip = image && (b[12] | (b[13] << 8)) == CONFIG_IDF_FIRMWARE_CHIP_ID;
+#else
+      bool chip = true;
+#endif
+      if (!app || !chip) { upErr = "That isn't a hub firmware file. Pick GroundwellHub.ino.bin (not the merged file, not a node file)."; Update.abort(); return; }
+    }
+    if (Update.write(up.buf, up.currentSize) != up.currentSize) { upErr = String("Write failed: ") + Update.errorString(); Update.abort(); }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (upAuthed && !upErr.length() && !Update.end(true)) upErr = String("The file didn't check out: ") + Update.errorString();
+  } else if (up.status == UPLOAD_FILE_ABORTED) {      // the browser went away: the done handler won't run
+    if (Update.isRunning()) Update.abort();
+    upErr = "Upload interrupted. Nothing was changed.";
+    if (otaBusy) { otaBusy = false; scan->start(0, nullptr, false); }
+    Serial.println("Web update interrupted: nothing changed");
+  }
+}
+
+static void handleUpdateDone() {
+  if (!upAuthed) { server.requestAuthentication(BASIC_AUTH, "groundwell hub", "Update password needed (user admin)"); return; }
+  if (upErr.length() || !Update.isFinished()) {
+    if (!upErr.length()) upErr = "The upload was incomplete. Nothing was changed.";
+    if (Update.isRunning()) Update.abort();
+    if (otaBusy) { otaBusy = false; scan->start(0, nullptr, false); }
+    server.send(400, "text/plain", upErr + " The hub keeps running " + FW_VERSION + ".");
+    Serial.printf("Web update failed: %s\n", upErr.c_str());
+    return;
+  }
+  trialStart();
+  server.send(200, "text/plain", "Done. The hub is restarting into the new firmware; this page reloads in about 25 s.");
+  Serial.println("Web update written: restarting into the new firmware");
+  delay(800);
+  ESP.restart();
+}
+
+static void startArduinoOta() {   // Arduino IDE network uploads, with the same password
+  if (arduinoOtaUp || cfg.otapw.length() < 8) return;
+  ArduinoOTA.setHostname(HOSTNAME);
+  ArduinoOTA.setPassword(cfg.otapw.c_str());
+  ArduinoOTA.setMdnsEnabled(false);                 // the hub runs mDNS itself (see loop)
+  ArduinoOTA.onStart([]() { otaBusy = true; scan->stop(); Serial.println("Arduino IDE upload started"); });
+  ArduinoOTA.onProgress([](unsigned int, unsigned int) { esp_task_wdt_reset(); });
+  ArduinoOTA.onEnd([]() { trialStart(); Serial.println("Arduino IDE upload done: restarting into the new firmware"); });
+  ArduinoOTA.onError([](ota_error_t e) { otaBusy = false; scan->start(0, nullptr, false); Serial.printf("Arduino IDE upload failed (error %u)\n", (unsigned)e); });
+  ArduinoOTA.begin();
+  arduinoOtaUp = true;
+}
+
 // ---------------- setup / loop ----------------
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\nGROUNDWELL hub starting");
+  Serial.printf("\nGROUNDWELL hub %s starting (slot %s)\n", FW_VERSION, slotName());
   lock = xSemaphoreCreateMutex();
   prefs.begin("groundwell", false);
+  trialCheckAtBoot();                              // may switch back to the previous firmware and restart
+  loadConfig();
+  pinMode(SETUP_BTN_PIN, INPUT_PULLUP);
 
 #if USE_EXTERNAL_ANTENNA
   pinMode(3, OUTPUT); digitalWrite(3, LOW);    // enable the RF switch
@@ -643,7 +999,8 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  if (cfg.ssid.length()) WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
+  else openSetup(0, "no Wi-Fi saved yet");
   configTime(0, 0, "pool.ntp.org", "time.google.com");   // UTC timestamps for the cloud
 
   BLEDevice::init("");
@@ -659,9 +1016,23 @@ void setup() {
   server.on("/api/history", HTTP_GET, handleHistory);
   server.on("/api/config", HTTP_POST, handleConfig);
   server.on("/api/admin", HTTP_POST, handleAdmin);
-  server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
+  server.on("/setup", HTTP_GET, handleSetupGet);
+  server.on("/setup", HTTP_POST, handleSetupSave);
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
+  server.onNotFound([]() {
+    if (fromHotspot()) {                           // phones probing for a captive portal land on the setup page
+      server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/setup");
+      server.send(302, "text/plain", "");
+      return;
+    }
+    server.send(404, "text/plain", "not found");
+  });
   server.begin();
   lastDayPush = lastUpload = millis();
+  if (trialActive) Serial.printf("Firmware %s is on trial (%u crashes allowed)\n", FW_VERSION, TRIAL_CRASHES - 1);
+  if (!esp_ota_get_next_update_partition(NULL)) Serial.println("WARNING: no second app slot, so over-the-air updates are off. Flash once over USB.");
+  startWatchdog();
 }
 
 void loop() {
@@ -670,28 +1041,60 @@ void loop() {
 
   bool connected = WiFi.status() == WL_CONNECTED;
   if (connected && !wasConnected) {
-    Serial.printf("Wi-Fi up. Dashboard: http://%s/\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Wi-Fi up. Dashboard: http://%s/  (http://%s.local/)\n", WiFi.localIP().toString().c_str(), HOSTNAME);
+    everConnected = true;
+    startArduinoOta();
     if (mdnsUp) MDNS.end();                          // re-announce on the (possibly new) network address
     mdnsUp = MDNS.begin(HOSTNAME);
     if (mdnsUp) MDNS.addService("http", "tcp", 80);
+    if (mdnsUp && arduinoOtaUp) MDNS.enableArduino(3232, true);   // shows up as a network port in Arduino IDE
     wifiRebootMark = 0;
   }
   wasConnected = connected;
+  if (arduinoOtaUp && connected) ArduinoOTA.handle();
+  trialMaybeConfirm();
+
+  // Setup hotspot: open when no Wi-Fi is saved, when the saved one isn't found after power-up, or when the
+  // BOOT button is held for 3 s. Wi-Fi retries pause while a phone is on it (they would knock it off).
+  static uint32_t btnSince = 0;
+  static bool btnFired = false;
+  if (digitalRead(SETUP_BTN_PIN) == LOW) {
+    if (!btnSince) btnSince = now | 1;
+    if (!btnFired && now - btnSince >= 3000) { btnFired = true; openSetup(SETUP_OPEN_MS, "BOOT button"); }
+  } else { btnSince = 0; btnFired = false; }
+  if (!apOn && !everConnected && cfg.ssid.length() && now >= SETUP_AFTER_MS) openSetup(0, "saved Wi-Fi not found");
+  int apClients = apOn ? WiFi.softAPgetStationNum() : 0;
+  if (apOn && apClients && !connected && cfg.ssid.length() && !staPaused) {
+    staPaused = true;
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect();
+    Serial.println("Setup page in use: Wi-Fi retries paused");
+  }
+  if (staPaused && !apClients) {
+    staPaused = false;
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
+  }
+  if (apOn) {
+    if (apClients) apIdleSince = 0; else if (!apIdleSince) apIdleSince = now | 1;
+    bool buttonWindow = apCloseAt && (int32_t)(apCloseAt - now) > 0;
+    if (connected && !buttonWindow && apIdleSince && now - apIdleSince >= 120000) closeSetup();
+  }
 
   // Wi-Fi watchdog. Auto-reconnect handles short drops, but when the router or mesh disappears for minutes
   // (a nightly reboot, say) the ESP32 can stop retrying. Start over every 30 s until it's back; after 30 min,
   // restart the hub once. Readings keep queuing in RAM meanwhile and upload when Wi-Fi returns.
   static uint32_t downSince = 0, lastKick = 0;
-  if (connected) downSince = 0;
+  if (connected || !cfg.ssid.length() || staPaused) downSince = 0;
   else {
     if (!downSince) downSince = lastKick = now ? now : 1;
     if (now - lastKick >= WIFI_RETRY_MS) {
       lastKick = now;
       Serial.printf("Wi-Fi down %lu s: reconnecting\n", (unsigned long)((now - downSince) / 1000));
       WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
     }
-    if (now - downSince >= WIFI_REBOOT_MS && wifiRebootMark != WIFI_REBOOT_MAGIC) {
+    if (now - downSince >= WIFI_REBOOT_MS && wifiRebootMark != WIFI_REBOOT_MAGIC && !apOn) {
       Serial.println("Wi-Fi down 30 min: restarting the hub (once per outage)");
       wifiRebootMark = WIFI_REBOOT_MAGIC;
       delay(200);
@@ -722,5 +1125,8 @@ void loop() {
     Serial.println();
     advHeard = advFresh = 0;
   }
+#if GW_CRASH_TEST
+  if (now > 20000) { Serial.println("Crash test build: crashing on purpose"); delay(50); abort(); }
+#endif
   delay(2);
 }
