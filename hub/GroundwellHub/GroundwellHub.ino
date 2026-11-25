@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL hub v0.11.0
+  GROUNDWELL hub v0.11.1
   Board: Seeed XIAO ESP32-C6, Arduino core "esp32 by Espressif Systems" 3.x (NOT 4.x: it replaced the BLE API),
          board "XIAO_ESP32C6", Tools > Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)".
          The menu only sets the IDE's size check: partitions.csv in this folder replaces the layout with two
@@ -10,6 +10,8 @@
     - Arduino IDE: the hub shows up under Tools > Port as a network port; upload as usual.
     - A new firmware runs on trial. If it crashes 3 times before it proves itself (Wi-Fi up, a node heard,
       a cloud upload accepted, 10 minutes running), the hub goes back to the previous firmware on its own.
+    - v0.11.1 fixes the /update file check, which refused every real upload up to v0.11.0. A hub on 0.11.0 or
+      older takes this update from the Arduino IDE's network port or espota.py (docs/SETUP.md section 6).
   Node updates (v0.10)
     - The hub carries the node firmware inside its own (node_fw.h, made from the node build; the GitHub build
       does this). After a hub update it checks every node, links new ones and updates old ones over Bluetooth,
@@ -72,6 +74,7 @@
 #include "diag_page.h"
 #include "gw_hmac.h"
 #include "node_dfu.h"
+#include "ota_check.h"                // web update check: is the file a hub app image (host-tested)
 #if __has_include("node_fw.h")
   #include "node_fw.h"                 // the node firmware to hand out (tools/make_node_fw_h.py; the GitHub build makes it)
 #endif
@@ -95,9 +98,9 @@
   #define GW_CRASH_TEST 0      // 1 = rollback test build: crashes 20 s after every boot (the GitHub build makes one)
 #endif
 #if GW_CRASH_TEST
-  #define GW_FW_VERSION "0.11.0-crashtest"
+  #define GW_FW_VERSION "0.11.1-crashtest"
 #else
-  #define GW_FW_VERSION "0.11.0"
+  #define GW_FW_VERSION "0.11.1"
 #endif
 static const char *FW_VERSION = GW_FW_VERSION;
 // Optional secrets.h (git-ignored): WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY and optionally OTA_PASS.
@@ -1063,11 +1066,19 @@ static void handleUpdatePage() {
 
 static bool upAuthed = false;
 static String upErr;
+static GwImgCheck upChk;                            // decides from the file's first 36 bytes, however they arrive
+#ifdef CONFIG_IDF_FIRMWARE_CHIP_ID
+static const uint16_t HUB_CHIP_ID = CONFIG_IDF_FIRMWARE_CHIP_ID;
+#else
+static const uint16_t HUB_CHIP_ID = GW_IMG_ANY_CHIP;
+#endif
+static const char *NOT_HUB_FILE = "That isn't a hub firmware file. Pick GroundwellHub.ino.bin (not the merged file, not a node file).";
 
 static void handleUpdateUpload() {
   HTTPUpload &up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
     upErr = "";
+    gwImgReset(upChk);
     upAuthed = cfg.otapw.length() && server.authenticate("admin", cfg.otapw.c_str());
     if (!upAuthed) { upErr = "Update password needed."; return; }
     const esp_partition_t *run = esp_ota_get_running_partition();
@@ -1080,19 +1091,12 @@ static void handleUpdateUpload() {
   } else if (up.status == UPLOAD_FILE_WRITE) {
     esp_task_wdt_reset();
     if (!upAuthed || upErr.length()) return;
-    if (Update.progress() == 0) {                   // first chunk: is this a hub app image?
-      const uint8_t *b = up.buf;
-      bool image = up.currentSize >= 36 && b[0] == 0xE9;
-      bool app = image && b[32] == 0x32 && b[33] == 0x54 && b[34] == 0xCD && b[35] == 0xAB;   // esp_app_desc_t magic
-#ifdef CONFIG_IDF_FIRMWARE_CHIP_ID
-      bool chip = image && (b[12] | (b[13] << 8)) == CONFIG_IDF_FIRMWARE_CHIP_ID;
-#else
-      bool chip = true;
-#endif
-      if (!app || !chip) { upErr = "That isn't a hub firmware file. Pick GroundwellHub.ino.bin (not the merged file, not a node file)."; Update.abort(); return; }
-    }
+    // Not "Update.progress() == 0": progress only moves once Update has a full 4 KB sector, and the web server
+    // hands the file over in 1436-byte pieces (v0.11.0 checked the second piece and refused every upload).
+    if (gwImgFeed(upChk, up.buf, up.currentSize, HUB_CHIP_ID) == GW_IMG_BAD) { upErr = NOT_HUB_FILE; Update.abort(); return; }
     if (Update.write(up.buf, up.currentSize) != up.currentSize) { upErr = String("Write failed: ") + Update.errorString(); Update.abort(); }
   } else if (up.status == UPLOAD_FILE_END) {
+    if (upAuthed && !upErr.length() && !gwImgAccepted(upChk)) { upErr = NOT_HUB_FILE; Update.abort(); }   // shorter than a header
     if (upAuthed && !upErr.length() && !Update.end(true)) upErr = String("The file didn't check out: ") + Update.errorString();
   } else if (up.status == UPLOAD_FILE_ABORTED) {      // the browser went away: the done handler won't run
     if (Update.isRunning()) Update.abort();

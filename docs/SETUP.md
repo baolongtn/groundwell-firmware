@@ -8,7 +8,7 @@
   LTR390 / VEML7700 / GL5539 light, LTR390 UV                                                air + light history, once a minute
 ```
 
-**Versions:** node firmware v0.11.0, hub firmware v0.11.0 (the hub updates its nodes for you, section 6; diagnostics page, section 5), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
+**Versions:** node firmware v0.11.1 (XIAO and the Nano ESP32 test node), hub firmware v0.11.1 (the hub updates its nodes for you, section 6; diagnostics page, section 5), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
 
 **New in v0.9**
 - **Battery profile, on USB or battery alike.** The node reads every 30 s instead of 5 s, broadcasts each reading in a 6 s burst and then turns the radio off, and keeps every sensor powered down or in standby between readings. The CPU already slept between readings.
@@ -204,7 +204,9 @@ All the analog inputs sit on A0 to A3, the ESP32-S3's ADC1. D0/D1 are the Nano's
 4. Upload `node/GroundwellNode`. The banner says `Arduino Nano ESP32 test node: broadcast only`, and the reading lines look like the XIAO's.
 5. Run factory calibration (section 2b). `factory_cal.py` finds a Nano ESP32 by itself, like a XIAO. Calibrate even if you only want raw numbers: its ADC reads differently from the XIAO's, and calibration puts its capacitive probe on the same 0 to 100 scale.
 
-Every push also builds it on GitHub: Actions > latest run > Artifacts > `node-nano-esp32/GroundwellNode.ino.bin`.
+Every push also builds it on GitHub: Actions > latest run > Artifacts > `node-nano-esp32/GroundwellNode-nano-esp32.bin` (and `GroundwellNode-nano-esp32.merged.bin`, which a web flasher writes at address 0). Arduino IDE from source is the easier way to flash a Nano.
+
+**Keeping it current.** The hub never updates a Nano, so when a release changes the node firmware, upload the sketch to the Nano over USB again. It keeps its calibration (stored in its own settings memory, which an upload doesn't erase). Its firmware version matches the XIAO's: the serial banner and `INFO` show it.
 
 **How it differs from a XIAO node.**
 - **Broadcast only.** Its adverts don't accept connections, so the hub reads them but never links or updates this node. Update it over USB. The hub's node list shows its firmware as unchecked, which is expected.
@@ -365,14 +367,20 @@ Firmware files come from the GitHub build: every push to `groundwell-firmware` b
 | `GroundwellHub-crashtest.bin` | Rollback test: a hub build that crashes 20 s after every boot |
 | `GroundwellNode.ino.zip` | Node update over Bluetooth (nRF Connect) |
 | `GroundwellNode.uf2` | Node flash over USB without Arduino IDE: double-tap reset, drag onto the XIAO drive |
+| `node-nano-esp32/GroundwellNode-nano-esp32.bin` | Nano ESP32 test node (section 2c); flashed over USB, never over the air |
 
 ### Hub
 
 - **From a browser:** `http://plants.local/update` (user `admin`, your update password). Pick `GroundwellHub.ino.bin` and upload; it takes under a minute, then the hub restarts into it.
+- **A hub on v0.11.0 or older refuses every browser upload** ("That isn't a hub firmware file"), even the right file. Its file check looked at the wrong piece of the upload; v0.11.1 fixes it. Nothing gets written, so the hub is fine. Move such a hub to v0.11.1 once, from the Arduino IDE (below) or with `espota.py` from a Command Prompt, which sends the `.bin` the same way the IDE does:
+  ```
+  python "%LOCALAPPDATA%\Arduino15\packages\esp32\hardware\esp32\<version>\tools\espota.py" -i plants.local -a <update password> -f GroundwellHub.ino.bin -r
+  ```
+  If Windows Firewall asks about Python, allow it on private networks: the hub connects back to the PC to fetch the file. After that, browser updates work.
 - **From Arduino IDE:** the hub shows up under Tools > Port as a network port (`plants at 192.168.x.x`). Upload as usual; the IDE asks for the update password.
 - **Trial and rollback:** a new firmware runs on trial. If it crashes (or hangs for 60 s) 3 times before it has run 10 minutes, heard a node and had a cloud upload accepted, the hub goes back to the previous firmware on its own. `/update` shows how the last update went. Power cuts and the hub's own restarts don't count as crashes.
-- **Rollback test (worth doing once):** upload `GroundwellHub-crashtest.bin`. It boots, crashes 20 s later, three times, and about a minute and a half later the hub is back on 0.9.1 with a note on `/update`.
-- **What gets rejected:** the merged file, node files and other chips' firmware are refused before anything is written. A dropped upload changes nothing.
+- **Rollback test (worth doing once):** upload `GroundwellHub-crashtest.bin`. It boots, crashes 20 s later, three times, and about a minute and a half later the hub is back on the firmware it had before, with a note on `/update`.
+- **What gets rejected:** the merged file, node files and other chips' firmware (the Nano ESP32 node included) are refused before anything is written. A dropped upload changes nothing. The GitHub build feeds every file through the hub's actual check the way a browser sends it, in 1436-byte pieces (`tools/ota_check_test.cpp`).
 - **Settings later:** `http://plants.local/setup` (same password). Or hold the **BOOT** button for 3 s: the setup hotspot opens for 15 minutes, which is the way back in if you change routers or forget the password. If the saved Wi-Fi isn't found within 3 minutes of power-up, the hotspot opens on its own and closes once Wi-Fi is back.
 
 ### Nodes: the hub updates them
@@ -392,6 +400,8 @@ The hub carries the node firmware inside its own. Update the hub and it brings e
 Still works, for a node the hub can't reach: press its reset button once, then in **nRF Connect for Mobile** connect to **GW**, tap **DFU** and pick `GroundwellNode.ino.zip`. In those 10 minutes a node accepts an update without the link key; after them, only its hub can start one. No automatic rollback on the node: an interrupted update leaves it in its bootloader, so run it again or flash the `.uf2` over USB.
 
 ## Verified before release
+
+- **v0.11.1 hub web update check:** `tools/ota_check_test.cpp` runs the hub's `ota_check.h` against a fake Update library that, like the real one, only advances `progress()` per 4 KB sector. A hub image passes in browser-sized (1436-byte), 1-byte, 20-byte-first, 4 KB and 64 KB pieces; the merged file, a node `.hex`, an ESP32-S3 (Nano) image, a 20-byte file and an empty file are refused. The v0.11.0 check, run the same way, refuses a good image in 1436-byte pieces, which is the bug. The v0.10 `GroundwellHub.ino.bin` that a v0.9.1 hub refused passes. Every GitHub build repeats this on its own output files.
 
 - **v0.9 node firmware:** compiles cleanly against stub headers in both wiring modes (the Seeed nRF52 core couldn't be downloaded for a full build; compile it in Arduino IDE before flashing). `tools/sensor_math_test.cpp` checks the CRC against Sensirion's worked example, the SHT4x and AHT20 conversions, LTR390 scaling, and the glitch filter (one-off spikes dropped, real changes kept). All pass.
 - **v0.9 packet:** `tools/bthome_roundtrip_test.cpp` covers air + light + UV at 26 bytes (inside the 31-byte broadcast) and a v0.6 packet with battery %. All pass.

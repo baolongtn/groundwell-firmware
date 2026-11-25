@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL sensor node v0.11.0  (two soil probes + air temperature/humidity + light + UV, one board)
+  GROUNDWELL sensor node v0.11.1  (two soil probes + air temperature/humidity + light + UV, one board)
   Board:  Seeed XIAO nRF52840 (plain or Sense)
           Arduino IDE: Boards Manager URL
             https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
@@ -118,7 +118,7 @@
       I2C sensors  (LIGHT_I2C) SDA -> A4, SCL -> A5; the rod reference stays on D4
 */
 
-static const char *FW_VERSION = "0.11.0";
+static const char *FW_VERSION = "0.11.1";
 
 // ---------------- light sensor choice ----------------
 #define LIGHT_LDR      1                         // GL5539 photoresistor + DHT11, no I2C (the parts in hand)
