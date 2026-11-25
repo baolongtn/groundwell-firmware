@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL hub v0.11.1
+  GROUNDWELL hub v0.12.0
   Board: Seeed XIAO ESP32-C6, Arduino core "esp32 by Espressif Systems" 3.x (NOT 4.x: it replaced the BLE API),
          board "XIAO_ESP32C6", Tools > Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)".
          The menu only sets the IDE's size check: partitions.csv in this folder replaces the layout with two
@@ -22,6 +22,22 @@
     - http://plants.local/diag (Admin > Diagnostics): what the hub is doing now, hub, Wi-Fi, Bluetooth and
       cloud state, every node's traffic, signal, battery, firmware and update status, what each node reports
       about itself, the probes, and an event log. "Download snapshot" saves it all as one file for debugging.
+  Sensors wired to the hub (v0.12)
+    - The hub can carry its own sensors, like a node: capacitive probe, DHT11, photoresistor and the I2C
+      sensors (SHT4x, AHT20, LTR390). It reads them every 30 s with the node's own code
+      (local_sensors.h) and they show up as one more node, "wired to this hub". Wiring: local_sensors.h and
+      docs/SETUP.md section 4b. Turn them on at /setup ("Sensors wired to this hub").
+    - Factory calibration over USB with the node's commands (INFO, CAL AIR, CAL WATER, FAST) and tools/factory_cal.py.
+  Health checks (v0.12)
+    - /diag opens with a verdict for every link of the chain (nodes, Bluetooth, the hub's sensors, the hub, Wi-Fi,
+      cloud) and a list of findings. Per node: readings received against expected over the last hour, dropped
+      packets, timing against the expected interval, copies heard per reading, signal, battery, firmware against
+      the version this hub carries, and how far behind the cloud is.
+    - Fix: the packet id is one byte, so its 255 -> 0 wrap every 256 readings counted as a node restart (and made
+      the hub check that node every 2 h). Restarts are now told apart from the wrap, and a node that has just
+      been reset is spotted by its continuous advertising in its link window.
+    - Rod probes are gone (node firmware 0.12). A probe a node stops sending is dropped from the cards and the
+      upload at once, so the rod card of an updated node goes away by itself. v0.11 nodes still work.
   Setup page (v0.9.1)
     - Wi-Fi, cloud URL, ingest key and the update password live in the hub's own memory, set on /setup.
     - No Wi-Fi saved, or none found within 3 minutes of power-up, or the BOOT button held for 3 s:
@@ -70,11 +86,17 @@
 #include <esp_system.h>
 #include <time.h>
 #include "bthome.h"
-#include "page.h"
-#include "diag_page.h"
+#if __has_include("pages_gz.h")
+  #include "pages_gz.h"                // page.h and diag_page.h gzipped (tools/make_pages_gz.py; the GitHub build makes it)
+#else
+  #include "page.h"
+  #include "diag_page.h"
+  #define GW_PAGES_GZ 0
+#endif
 #include "gw_hmac.h"
 #include "node_dfu.h"
 #include "ota_check.h"                // web update check: is the file a hub app image (host-tested)
+#include "local_sensors.h"            // sensors wired to the hub (v0.12): the node's own measurement code
 #if __has_include("node_fw.h")
   #include "node_fw.h"                 // the node firmware to hand out (tools/make_node_fw_h.py; the GitHub build makes it)
 #endif
@@ -98,9 +120,9 @@
   #define GW_CRASH_TEST 0      // 1 = rollback test build: crashes 20 s after every boot (the GitHub build makes one)
 #endif
 #if GW_CRASH_TEST
-  #define GW_FW_VERSION "0.11.1-crashtest"
+  #define GW_FW_VERSION "0.12.0-crashtest"
 #else
-  #define GW_FW_VERSION "0.11.1"
+  #define GW_FW_VERSION "0.12.0"
 #endif
 static const char *FW_VERSION = GW_FW_VERSION;
 // Optional secrets.h (git-ignored): WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY and optionally OTA_PASS.
@@ -129,6 +151,9 @@ static const char *FW_VERSION = GW_FW_VERSION;
 #define HUB_ID      "home"                      // name of this hub in the cloud
 #define USE_EXTERNAL_ANTENNA 0                  // 1 if a U.FL antenna is plugged into the XIAO
 #define ADMIN_PIN   ""                          // "" = Admin view open to anyone on your Wi-Fi; set digits to require a PIN
+#ifndef HUB_SENSORS_DEFAULT
+  #define HUB_SENSORS_DEFAULT 0                 // sensors wired to the hub until /setup says otherwise (LS_* bits in local_sensors.h; 0 = none)
+#endif
 
 // Soil mapping for factory-calibrated probes, on the probe scale (percent between the unit's air
 // and water readings). Starting values from typical capacitive-probe data in potting mix; replace
@@ -152,6 +177,8 @@ static const int      SETUP_BTN_PIN    = BOOT_PIN;           // the BOOT button 
 // ========================================================
 
 static const int MAX_NODES = 8, MAX_SENSORS = 16, LIVE_LEN = 720, DAY_LEN = 288, QUEUE_LEN = 3000, CLIM_LEN = 600, LIGHT_LEN = 600;
+static const int H_SLOTS = 12, DT_LEN = 16;               // health window: 12 x 5 min = the last hour; last 16 reading gaps
+static const uint32_t H_SLOT_MS = 5UL * 60 * 1000;
 static const char *KIND[] = {"Capacitive", "Rod", "Probe 3", "Probe 4"};
 static const char *KIND_FC = "Capacitive FC";            // factory-calibrated capacitive probe
 static const uint16_t DEF_DRY[] = {3400, 60, 3000, 3000};   // starting guesses until you calibrate
@@ -188,6 +215,14 @@ struct Node {
   uint16_t checks;
   char diag[160];                // what the node reported about itself at the last check
   uint32_t diagAt;
+  // health (v0.12): the last hour in 5-minute slots (hSlot is the current one), and the last 16 reading gaps
+  uint16_t hRx[H_SLOTS], hLost[H_SLOTS], hAdv[H_SLOTS];
+  int32_t hRssi[H_SLOTS];        // sum of advert signal per slot; divided by hAdv it's the average
+  uint16_t dts[DT_LEN];          // time between new readings, 10 ms units
+  uint8_t dtHead, dtN;
+  uint32_t cloudTs;              // time stamp (epoch) of this node's newest soil reading the cloud accepted
+  uint32_t windowAt;             // when it was last seen advertising between bursts (its link window after a reset)
+  bool local;                    // the hub's own sensors (v0.12)
 };
 
 struct Sensor {
@@ -272,6 +307,12 @@ volatile uint32_t freshTotal = 0;            // new readings from GROUNDWELL nod
 uint32_t uploadsOk = 0, uploadsFail = 0, lastUploadAt = 0, lastUploadMs = 0, wifiUps = 0, wifiDownAt = 0;
 char lastUploadErr[100] = "";
 bool lastUploadGood = false;
+uint16_t uploadFailStreak = 0;               // failed uploads in a row (v0.12)
+uint8_t hSlot = 0, hSlots = 1;               // health window: current slot, and how many slots hold data so far
+uint32_t hSlotAt = 0;
+char localMac[18] = "";                      // the hub's own sensors appear as a node with this address
+volatile uint32_t localReadings = 0, localAirFails = 0, localLastAt = 0, localLastDt = 0;
+volatile uint16_t localCap = 0;
 
 static void logEvent(const char *fmt, ...) {   // Serial Monitor and the diagnostics page's event log
   char b[sizeof logBuf[0].t];
@@ -375,35 +416,53 @@ static void enqueue(uint8_t node, uint8_t ch, uint16_t raw) {
 }
 
 // ---------------- BLE ----------------
-static void handlePacket(const char *mac, int rssi, uint8_t addrType, bool connectable, const BTHomePacket &p) {
+// local = a reading from the hub's own sensors (v0.12): same path, but it isn't Bluetooth traffic.
+static void handlePacket(const char *mac, int rssi, uint8_t addrType, bool connectable, const BTHomePacket &p, bool local = false) {
   if (p.nCounts == 0 && !p.hasMoist) return;
-  advHeard++;
-  advTotal++;
+  if (!local) { advHeard++; advTotal++; }
   xSemaphoreTake(lock, portMAX_DELAY);
   int ni = findNode(mac, true);
   if (ni >= 0) {
     Node &n = nodes[ni];
-    n.lastSeen = millis();
+    uint32_t nowMs = millis();
+    n.lastSeen = nowMs;
     n.rssi = (int8_t)rssi;
     n.addrType = addrType;
     n.connectable = connectable;
     n.rescueAt = 0;                                       // it's running its app again
     n.adv++;
+    if (local && !n.local) {
+      n.local = true;
+      strlcpy(n.fw, FW_VERSION, sizeof n.fw);
+      strlcpy(n.st, "wired to this hub", sizeof n.st);
+    }
+    if (!local) { n.hAdv[hSlot]++; n.hRssi[hSlot] += rssi; }
     if (!n.firstSeen) {
-      n.firstSeen = millis() | 1;
+      n.firstSeen = nowMs | 1;
       n.rssiMin = n.rssiMax = (int8_t)rssi;
-      logEvent("Node %s first heard (%d dBm)", mac, rssi);
+      if (local) logEvent("Sensors wired to this hub: first reading (as node %s)", mac);
+      else logEvent("Node %s first heard (%d dBm)", mac, rssi);
     }
     if (rssi < n.rssiMin) n.rssiMin = (int8_t)rssi;
     if (rssi > n.rssiMax) n.rssiMax = (int8_t)rssi;
     bool fresh = !p.hasPid || !n.havePid || p.pid != n.lastPid;
+    if (!fresh && !local && connectable && n.lastFreshAt && nowMs - n.lastFreshAt > 8000 &&
+        (!n.windowAt || nowMs - n.windowAt > 600000)) {
+      // Still advertising 8 s after its reading, when a burst lasts 6 s: the node is in its 10-minute link
+      // window, so it was just reset or powered up. Check it now, while it can be linked.
+      n.windowAt = nowMs | 1;
+      if (!n.updating) n.nextCheckAt = 0;
+      logEvent("Node %s is in its link window (just reset or powered up)", mac);
+    }
     if (fresh) {
-      advFresh++;
-      freshTotal++;
+      if (!local) { advFresh++; freshTotal++; }
+      n.hRx[hSlot]++;
       if (p.hasPid && n.havePid) {
         uint8_t gap = (uint8_t)(p.pid - n.lastPid);
-        if (gap > 1 && gap < 50) n.lost += gap - 1;      // bigger jumps = node rebooted
-        if (p.pid <= 2 && n.lastPid > 2 && !n.updating) {   // just restarted: its link window is open, check now
+        if (gap > 1 && gap < 50) { n.lost += gap - 1; n.hLost[hSlot] += gap - 1; }   // bigger jumps = node restarted
+        // Restarted: the id went back to the start (the first packet after a reset is 1). The id is one byte,
+        // so 255 -> 0 every 256 readings is the normal wrap, not a restart (v0.11 took it for one).
+        if (p.pid <= 2 && gap >= 50 && !n.updating) {
           n.nextCheckAt = 0;
           n.restarts++;
           logEvent("Node %s restarted", mac);
@@ -411,8 +470,13 @@ static void handlePacket(const char *mac, int rssi, uint8_t addrType, bool conne
       }
       if (p.hasPid) { n.lastPid = p.pid; n.havePid = true; }
       n.rx++;
-      uint32_t nowMs = millis();
-      if (n.lastFreshAt) { uint32_t dt = nowMs - n.lastFreshAt; n.ivlMs = n.ivlMs ? (n.ivlMs * 7 + dt) / 8 : dt; }
+      if (n.lastFreshAt) {
+        uint32_t dt = nowMs - n.lastFreshAt;
+        n.ivlMs = n.ivlMs ? (n.ivlMs * 7 + dt) / 8 : dt;
+        n.dts[n.dtHead] = (uint16_t)(dt / 10 > 65535 ? 65535 : dt / 10);
+        n.dtHead = (n.dtHead + 1) % DT_LEN;
+        if (n.dtN < DT_LEN) n.dtN++;
+      }
       n.lastFreshAt = nowMs;
       if (p.hasVolt) n.volt = p.volt;
       if (p.hasBatt) n.batt = p.batt;
@@ -465,6 +529,12 @@ static void handlePacket(const char *mac, int rssi, uint8_t addrType, bool conne
         s.dayN++;
         enqueue(ni, c, s.raw);
       }
+      // A probe this node no longer sends (the rod probe, after a node update to 0.12): drop its card and
+      // stop listing it in the upload. Its readings already queued still go to the cloud.
+      for (int k = 0; k < MAX_SENSORS; k++) if (sensors[k].used && sensors[k].node == ni && sensors[k].ch >= nv) {
+        logEvent("Node %s no longer sends probe %u (%s): card removed", mac, sensors[k].ch, sensors[k].name);
+        sensors[k].used = false;
+      }
     }
   }
   xSemaphoreGive(lock);
@@ -499,6 +569,16 @@ static void pushDay() {
   }
   xSemaphoreGive(lock);
   lastDayPush = millis();
+}
+
+// Health window (v0.12): every 5 minutes start a new slot, dropping the one from an hour ago.
+static void rotateHealthSlot() {
+  xSemaphoreTake(lock, portMAX_DELAY);
+  hSlot = (hSlot + 1) % H_SLOTS;
+  for (int i = 0; i < MAX_NODES; i++) { Node &n = nodes[i]; n.hRx[hSlot] = n.hLost[hSlot] = n.hAdv[hSlot] = 0; n.hRssi[hSlot] = 0; }
+  if (hSlots < H_SLOTS) hSlots++;
+  hSlotAt = millis();
+  xSemaphoreGive(lock);
 }
 
 // ---------------- cloud upload ----------------
@@ -617,9 +697,14 @@ static void uploadBatch() {
     if (lastUploadGood || uploadsFail == 1) logEvent("Cloud upload failed: HTTP %d %s", code, lastUploadErr);
     lastUploadGood = false;
   }
+  if (code == 200) uploadFailStreak = 0; else uploadFailStreak++;
   if (code == 200) {
     xSemaphoreTake(lock, portMAX_DELAY);
     int drop = n < qCount ? n : qCount;                 // readings that arrived meanwhile stay queued
+    for (int k = 0; k < drop; k++) {                    // newest reading of each node the cloud now holds
+      const Rec &r = queue_[(qHead + k) % QUEUE_LEN];
+      if (r.ts > nodes[r.node].cloudTs) nodes[r.node].cloudTs = r.ts;
+    }
     qHead = (qHead + drop) % QUEUE_LEN;
     qCount -= drop;
     int dropC = nc < cCount ? nc : cCount;
@@ -640,9 +725,19 @@ static void uploadBatch() {
 }
 
 // ---------------- web ----------------
+// The dashboard and diagnostics pages: gzipped when the build made pages_gz.h (about 30 KB less flash).
+static void sendAppPage(bool diag) {
+#if GW_PAGES_GZ
+  server.sendHeader("Content-Encoding", "gzip");
+  server.send_P(200, "text/html", (PGM_P)(diag ? DIAG_PAGE_GZ : PAGE_GZ), diag ? DIAG_PAGE_GZ_LEN : PAGE_GZ_LEN);
+#else
+  server.send_P(200, "text/html", diag ? DIAG_PAGE : PAGE);
+#endif
+}
+
 static void handleRoot() {
   if (!cfg.ssid.length()) { server.sendHeader("Location", "/setup"); server.send(302, "text/plain", ""); return; }
-  server.send_P(200, "text/html", PAGE);
+  sendAppPage(false);
 }
 
 static void handleLive() {
@@ -692,6 +787,7 @@ static void handleLive() {
     j += ",\"brssi\":"; j += nd.rssi;
     j += ",\"ageS\":"; j += (now - nd.lastSeen) / 1000;
     j += ",\"loss\":"; j += tot ? String(100.0f * nd.lost / tot, 1) : String("0");
+    j += ",\"wired\":"; j += nd.local ? "true" : "false";
     j += ",\"nfw\":\""; j += nd.fw;
     j += "\",\"nst\":\""; j += nd.st;
     if (nd.updating) { j += " ("; j += nd.pct; j += "%)"; }
@@ -926,7 +1022,9 @@ static void trialCheckAtBoot() {
 
 static void trialMaybeConfirm() {   // proven: 10 minutes up, on Wi-Fi, a node heard, and a cloud upload accepted (if the cloud is on)
   if (!trialActive || millis() < TRIAL_MIN_MS) return;
-  if (WiFi.status() != WL_CONNECTED || advTotal == 0) return;
+  // A node heard over Bluetooth; or, for a hub with only its own sensors, a reading from them and proof that
+  // the Bluetooth scanner works (it hears some device, a phone say).
+  if (WiFi.status() != WL_CONNECTED || !(advTotal > 0 || (localReadings > 0 && btAll > 0))) return;
   if (cfg.url.length() && !lastUploadOk) return;
   trialActive = false;
   otaPrefs.putBool("trial", false);
@@ -949,7 +1047,8 @@ static const char PAGE_HEAD[] PROGMEM =
   "border:1px solid #d9c7b5;border-radius:3px;font-size:1rem;background:#fff}button{margin-top:1.2rem;padding:.6rem 1.2rem;"
   "background:#6f8f5e;color:#fff;border:0;border-radius:3px;font-size:1rem}.note{font-size:.85rem;color:#8a7461}"
   ".msg{padding:.6rem .8rem;background:#f3e3d3;border-radius:3px}.err{background:#f6d6cc}a{color:#6f8f5e}"
-  "table{border-collapse:collapse}td{padding:.15rem .8rem .15rem 0}</style></head><body><h1>groundwell hub</h1>";
+  "table{border-collapse:collapse}td{padding:.15rem .8rem .15rem 0}.c{font-weight:400;display:flex;gap:.5rem;align-items:flex-start;margin:.35rem 0}"
+  ".c input{width:auto;margin-top:.2rem}</style></head><body><h1>groundwell hub</h1>";
 
 static String htmlEsc(const String &s) {
   String o;
@@ -991,6 +1090,18 @@ static void handleSetupPage(const String &msg, bool isErr) {
   b += "<label>Ingest key</label><input name=key type=password placeholder=\""; b += cfg.key.length() ? "saved (leave blank to keep)" : "the INGEST_KEY you gave Cloudflare"; b += "\">";
   b += "<label>Update password</label><input name=otapw type=password minlength=8 placeholder=\""; b += cfg.otapw.length() ? "saved (leave blank to keep)" : "choose one, 8+ characters"; b += "\">";
   b += "<div class=note>Protects firmware updates and this page on your Wi-Fi. User name: admin.</div>";
+  uint8_t m = cfgPrefs.getUChar("hubsens", HUB_SENSORS_DEFAULT);
+  auto chk = [&](const char *name, uint8_t bit, const char *text) {
+    b += "<label class=c><input type=checkbox name="; b += name; b += (m & bit) ? " checked" : ""; b += "> "; b += text; b += "</label>";
+  };
+  b += "<label>Sensors wired to this hub</label>";
+  chk("s_on", LS_ON, "Capacitive probe on D0, powered from D1 (turns the hub's own sensors on)");
+  chk("s_dht", LS_DHT, "DHT11 on D6");
+  chk("s_ldr", LS_LDR, "Photoresistor from D7 to D2 (1 kOhm from D2 to GND)");
+#if HUB_I2C_SENSORS
+  chk("s_i2c", LS_I2C, "I2C sensors on D4/D5 (SHT40 or AHT20, LTR390; found automatically)");
+#endif
+  b += "<div class=note>The hub reads these like a node, every 30 s, and shows them as one more pot. Leave all unticked for a hub without sensors.</div>";
   b += "<button>Save and restart</button></form>";
   sendPage(isErr ? 400 : 200, b);
 }
@@ -1011,6 +1122,11 @@ static void handleSetupSave() {
   cfgPrefs.putString("url", url);
   if (key.length()) cfgPrefs.putString("key", key);
   if (otapw.length()) cfgPrefs.putString("otapw", otapw);
+  uint8_t sens = 0;
+  if (server.hasArg("s_on")) {
+    sens = LS_ON | (server.hasArg("s_dht") ? LS_DHT : 0) | (server.hasArg("s_ldr") ? LS_LDR : 0) | (server.hasArg("s_i2c") ? LS_I2C : 0);
+  }
+  cfgPrefs.putUChar("hubsens", sens);
   logEvent("Settings saved on /setup: restarting to join %s", ssid.c_str());
   sendPage(200, "<p class=msg>Saved. The hub is restarting and will join <b>" + htmlEsc(ssid) +
                 "</b>. On that network the dashboard is at <a href=http://" HOSTNAME ".local/>http://" HOSTNAME ".local/</a>.</p>");
@@ -1152,6 +1268,7 @@ static const char *DFU_PKT  = "00001532-1212-efde-1523-785feabcd123";
 static const uint32_t CHECK_EVERY_MS = 24UL * 3600 * 1000;
 static const float    UPDATE_MIN_V   = 2.7f;      // below this a coin cell may sag mid-update: wait
 static const uint32_t JOB_MAX_MS     = 8UL * 60 * 1000;
+static const uint8_t  ADV_BURST_COPIES = 24;     // a node repeats each reading every 250 ms for 6 s (node sketch: ADV_INTERVAL_MS, ADV_BURST_S)
 
 static BLEClient *nodeClient = nullptr;            // one client for the hub's lifetime (the library keeps a pointer to it)
 static QueueHandle_t notifQ;
@@ -1442,7 +1559,7 @@ static String activityNow() {
   return "Listening for nodes";
 }
 
-static void handleDiagPage() { if (setupAuthOk()) server.send_P(200, "text/html", DIAG_PAGE); }
+static void handleDiagPage() { if (setupAuthOk()) sendAppPage(true); }
 
 static void handleDiagCheck() {                    // POST i=<node>: check that node at its next burst
   if (!setupAuthOk()) return;
@@ -1459,11 +1576,23 @@ static void handleDiagApi() {
   time_t epoch = time(nullptr);
   const esp_partition_t *run = esp_ota_get_running_partition();
   String j;
-  j.reserve(14000);
+  j.reserve(18000);
   j += '{';
   jsonKV(j, "now", activityNow().c_str());
   jsonKV(j, "uptimeS", (long)(now / 1000));
   jsonKV(j, "epoch", epoch > 1700000000 ? (long)epoch : 0L);
+  // What a healthy system looks like (v0.12): the page's health checks compare against these.
+  j += "\"expect\":{";
+  jsonKV(j, "nodeIvlS", (long)(NODE_INTERVAL_MS / 1000));
+  jsonKV(j, "uploadS", (long)(UPLOAD_MS / 1000));
+  jsonKV(j, "staleS", (long)(STALE_MS / 1000));
+  jsonKV(j, "minMv", (long)lroundf(UPDATE_MIN_V * 1000));
+  jsonKV(j, "nodeFw", NODE_FW_VERSION);
+  jsonKB(j, "bundled", NODE_FW_BUNDLED);
+  jsonKV(j, "checkS", (long)(CHECK_EVERY_MS / 1000));
+  jsonKV(j, "hourS", (long)((hSlots - 1) * (H_SLOT_MS / 1000) + (now - hSlotAt) / 1000));   // how much of the last hour the counts cover
+  jsonKV(j, "copies", (long)(ADV_BURST_COPIES));
+  jsonEnd(j, '}'); j += ',';
   j += "\"hub\":{";
   jsonKV(j, "fw", FW_VERSION);
   jsonKV(j, "slot", run ? run->label : "?");
@@ -1477,6 +1606,23 @@ static void handleDiagApi() {
   jsonKV(j, "nodeFw", NODE_FW_VERSION);
   jsonKV(j, "nodeFwLen", (long)NODE_FW_LEN);
   jsonKV(j, "note", otaPrefs.getString("note", "").c_str());
+  j += "\"sens\":{";                                // sensors wired to the hub (v0.12)
+  jsonKB(j, "on", lsMask & LS_ON);
+  jsonKB(j, "dht", lsMask & LS_DHT); jsonKB(j, "ldr", lsMask & LS_LDR); jsonKB(j, "i2c", lsMask & LS_I2C);
+  jsonKV(j, "mac", localMac);
+  jsonKV(j, "air", airSrc);
+  jsonKV(j, "light", lightName());
+  jsonKB(j, "uv", ltrOk);
+  jsonKB(j, "i2cFound", shtOk || ahtOk || ltrOk);
+  jsonKB(j, "cal", calOk);
+  jsonKV(j, "calAir", calOk ? (long)cal.air : 0L); jsonKV(j, "calWater", calOk ? (long)cal.water : 0L);
+  jsonKV(j, "n", (long)localReadings);
+  jsonKV(j, "airFail", (long)localAirFails);
+  jsonKV(j, "lastS", ageS(now, localLastAt));
+  jsonKV(j, "dtMs", (long)localLastDt);
+  jsonKB(j, "fast", localFast());
+  jsonKV(j, "cap", (long)localCap); jsonKV(j, "ldrAdc", (long)ldrAdc);
+  jsonEnd(j, '}'); j += ',';
   jsonEnd(j, '}'); j += ',';
   bool wup = WiFi.status() == WL_CONNECTED;
   j += "\"wifi\":{";
@@ -1523,6 +1669,9 @@ static void handleDiagApi() {
   jsonKV(j, "q", (long)qCount); jsonKV(j, "qMax", (long)QUEUE_LEN);
   jsonKV(j, "c", (long)cCount); jsonKV(j, "cMax", (long)CLIM_LEN);
   jsonKV(j, "l", (long)lCount); jsonKV(j, "lMax", (long)LIGHT_LEN);
+  jsonKV(j, "streak", (long)uploadFailStreak);
+  // How far behind the cloud is: age of the oldest reading still waiting to be sent.
+  jsonKV(j, "oldestS", (qCount && epoch > 1700000000) ? (long)(epoch - queue_[qHead].ts) : (qCount ? -2L : -1L));
   jsonEnd(j, '}'); j += ',';
   xSemaphoreTake(lock, portMAX_DELAY);
   j += "\"nodes\":[";
@@ -1535,7 +1684,7 @@ static void handleDiagApi() {
     j += '{';
     jsonKV(j, "i", (long)i);
     jsonKV(j, "mac", n.mac);
-    jsonKV(j, "type", n.addrType == 1 ? "random" : n.addrType == 0 ? "public" : "other");
+    jsonKV(j, "type", n.local ? "wired to this hub" : n.addrType == 1 ? "random" : n.addrType == 0 ? "public" : "other");
     jsonKV(j, "probes", probes.c_str());
     jsonKB(j, "online", now - n.lastSeen < STALE_MS);
     jsonKV(j, "seenS", ageS(now, n.lastSeen));
@@ -1563,6 +1712,26 @@ static void handleDiagApi() {
     jsonKV(j, "checkS", ageS(now, n.lastCheckAt));
     jsonKV(j, "diag", n.diag);
     jsonKV(j, "diagS", ageS(now, n.diagAt));
+    // health (v0.12): the last hour, the last 16 gaps between readings, and the cloud
+    long hrx = 0, hlost = 0, hadv = 0, hrssi = 0;
+    for (int k = 0; k < H_SLOTS; k++) { hrx += n.hRx[k]; hlost += n.hLost[k]; hadv += n.hAdv[k]; hrssi += n.hRssi[k]; }
+    jsonKB(j, "local", n.local);
+    jsonKV(j, "hRx", hrx); jsonKV(j, "hLost", hlost); jsonKV(j, "hAdv", hadv);
+    jsonKV(j, "hRssi", hadv ? lroundf((float)hrssi / hadv) : 0L);
+    uint16_t g[DT_LEN];
+    uint8_t ng = n.dtN;
+    for (int k = 0; k < ng; k++) g[k] = n.dts[(n.dtHead - 1 - k + DT_LEN) % DT_LEN];
+    long gLast = ng ? (long)g[0] * 10 : 0;
+    for (int a = 1; a < ng; a++) { uint16_t v = g[a]; int b = a - 1; while (b >= 0 && g[b] > v) { g[b + 1] = g[b]; b--; } g[b + 1] = v; }
+    jsonKV(j, "dtN", (long)ng);
+    jsonKV(j, "dtMed", ng ? (long)g[ng / 2] * 10 : 0L);       // ms
+    jsonKV(j, "dtMin", ng ? (long)g[0] * 10 : 0L);
+    jsonKV(j, "dtMax", ng ? (long)g[ng - 1] * 10 : 0L);
+    jsonKV(j, "dtLast", gLast);
+    jsonKV(j, "cloudS", (n.cloudTs && epoch > 1700000000) ? (long)(epoch - n.cloudTs) : -1L);
+    jsonKV(j, "airS", n.hasAir ? ageS(now, n.airAt) : -1L);
+    jsonKV(j, "luxS", n.hasLux ? ageS(now, n.luxAt) : -1L);
+    jsonKV(j, "windowS", ageS(now, n.windowAt));
     jsonEnd(j, '}'); j += ',';
   }
   jsonEnd(j, ']'); j += ',';
@@ -1594,6 +1763,119 @@ static void handleDiagApi() {
   j += '}';
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", j);
+}
+
+// ---------------- sensors wired to the hub (v0.12) ----------------
+// Read on the node's schedule in a task of their own, so a slow cloud upload never delays a reading (and the
+// factory fixture's 5 s timing check passes). Each reading becomes the node's packet and goes through
+// handlePacket(), exactly like one heard over Bluetooth. The same task answers the node's serial commands.
+static void localInfo() {
+  Serial.printf("INFO fw=%s mac=%s board=hub interval_ms=%lu light=%s air=%s uv=%s ", FW_VERSION, localMac,
+                (unsigned long)REPORT_MS, lightName(), airSrc, ltrOk ? "ltr390" : "none");
+  if (calOk) Serial.printf("cal=yes air=%u water=%u OK\n", cal.air, cal.water);
+  else       Serial.println("cal=no OK");
+}
+
+static void localCommand(char *line) {
+  for (char *c = line; *c; c++) if (*c >= 'a' && *c <= 'z') *c -= 32;   // case-insensitive
+  if (!line[0]) return;
+  if (!(lsMask & LS_ON)) { Serial.println("ERR hub sensors are off: tick \"Sensors wired to this hub\" at http://" HOSTNAME ".local/setup"); return; }
+  unsigned a = 0, w = 0;
+  if (!strcmp(line, "INFO")) localInfo();
+  else if (!strcmp(line, "CAL AIR"))   { if (measurePoint("AIR", pendAir))     { if (pendWater) finishCal(pendAir, pendWater); } else pendAir = 0; }
+  else if (!strcmp(line, "CAL WATER")) { if (measurePoint("WATER", pendWater)) { if (pendAir) finishCal(pendAir, pendWater); } else pendWater = 0; }
+  else if (sscanf(line, "CAL SET %u %u", &a, &w) == 2) finishCal((uint16_t)a, (uint16_t)w);
+  else if (!strcmp(line, "CAL CLEAR")) { storeRemove(CAL_FILE); calOk = false; pendAir = pendWater = 0; Serial.println("CAL CLEARED OK"); }
+  else if (!strcmp(line, "FAST"))      { fastUntil = millis() + FAST_FOR_MS; Serial.printf("FAST interval_ms=%lu for_s=%lu OK\n", (unsigned long)FAST_REPORT_MS, (unsigned long)(FAST_FOR_MS / 1000)); }
+  else Serial.printf("ERR unknown command: %s\n", line);
+}
+
+static void serviceLocalSerial() {
+  static char buf[48];
+  static uint8_t n = 0;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r' || c == '\n') { buf[n] = 0; if (n) localCommand(buf); n = 0; }
+    else if (n < sizeof buf - 1) buf[n++] = c;
+  }
+}
+
+static void localReading() {
+  static uint8_t pid = 0;
+  static AirFilter airF = {false, false, 0, 0, 0, 0};
+  uint16_t cap  = readCapacitive();
+  float tempC = 0, rh = 0;
+  bool airRead = false, airOk = false;
+  if (hasAirSensor()) {
+    airRead = readAir(tempC, rh);
+    if (!airRead) localAirFails = localAirFails + 1;
+    airOk = airRead && airFilter(airF, tempC, rh);
+  }
+  float lux = 0;
+  bool luxOk = readLight(lux);
+  float uvi = 0;
+  bool uvOk = readUV(uvi);
+  int32_t capPct = calOk ? (int32_t)probeScaleX100(cap) : -1;
+
+  // The node's own packet, decoded by the hub's own parser: identical numbers to a Bluetooth node.
+  uint8_t svc[31];
+  uint8_t len = buildBTHome(svc, ++pid, airOk, tempC, rh, luxOk, lux, ESP_VDD_MV / 1000.0f, capPct, cap, uvOk, uvi);
+  BTHomePacket p;
+  if (parseBTHome(svc + 2, len - 2, p)) handlePacket(localMac, 0, 0, false, p, true);
+  uint32_t now = millis();
+  localLastDt = localLastAt ? now - localLastAt : 0;
+  localLastAt = now;
+  localReadings = localReadings + 1;
+  localCap = cap;
+
+  // What the "node" reports about itself, in the node's diagnostics format (Diagnostics > Details).
+  char dg[160];
+  snprintf(dg, sizeof dg, "up=%lu;rst=%s;n=%lu;air=%s;airfail=%lu;light=%s;cal=%d;ivl=%lu", (unsigned long)(now / 1000),
+           espResetText(esp_reset_reason()), (unsigned long)localReadings, airSrc, (unsigned long)localAirFails, lightName(),
+           calOk ? 1 : 0, (unsigned long)((localFast() ? FAST_REPORT_MS : REPORT_MS) / 1000));
+  xSemaphoreTake(lock, portMAX_DELAY);
+  int ni = findNode(localMac, false);
+  if (ni >= 0) { strlcpy(nodes[ni].diag, dg, sizeof nodes[ni].diag); nodes[ni].diagAt = now | 1; }
+  xSemaphoreGive(lock);
+
+  // Same line as a node prints, so tools/factory_cal.py reads the hub the same way.
+  char airTxt[48], luxTxt[48], capTxt[32];
+  if (airOk)        snprintf(airTxt, sizeof airTxt, "air %.1f C %.0f%%RH", tempC, rh);
+  else if (airRead) snprintf(airTxt, sizeof airTxt, "air: %.1f C %.0f%%RH held (jump)", tempC, rh);
+  else              snprintf(airTxt, sizeof airTxt, hasAirSensor() ? "air: %s read failed" : "air: none", airSrc);
+  if (ltrOk) snprintf(luxTxt, sizeof luxTxt, uvOk ? "light %.0f lux uv %.1f" : "light %.0f lux", lux, uvi);
+  else if (lsMask & LS_LDR) snprintf(luxTxt, sizeof luxTxt, "light %.0f lux (adc %u)", lux, ldrAdc);
+  else snprintf(luxTxt, sizeof luxTxt, "light: none");
+  if (capPct >= 0) snprintf(capTxt, sizeof capTxt, "capacitive %4u = %5.1f%%", cap, capPct / 100.0f);
+  else             snprintf(capTxt, sizeof capTxt, "capacitive %4u (uncal)", cap);
+  Serial.printf("#%u dt=%lums  %s  %s  %s  VDD %.2f V\n", pid, (unsigned long)localLastDt, capTxt, airTxt, luxTxt, ESP_VDD_MV / 1000.0f);
+}
+
+static void localTask(void *) {
+  uint32_t nextAt = millis() + 5000;                 // first reading 5 s after start
+  for (;;) {
+    while ((int32_t)(nextAt - millis()) > 0) { serviceLocalSerial(); vTaskDelay(pdMS_TO_TICKS(50)); }
+    if (lsMask & LS_ON) localReading();
+    // Absolute schedule, like the node: due REPORT_MS after the last one was due, however long this one took.
+    uint32_t every = localFast() ? FAST_REPORT_MS : REPORT_MS;
+    nextAt += every;
+    if ((int32_t)(millis() - nextAt) >= 0) nextAt = millis() + every;   // fell behind (a 10 s calibration, say)
+  }
+}
+
+static void localStart() {
+  uint8_t mask = cfgPrefs.getUChar("hubsens", HUB_SENSORS_DEFAULT);
+  lsBegin(mask);
+  String a = BLEDevice::getAddress().toString().c_str();
+  a.toUpperCase();
+  strlcpy(localMac, a.c_str(), sizeof localMac);
+  if (mask & LS_ON) {
+    logEvent("Sensors wired to this hub: capacitive probe%s%s; air %s, light %s%s; factory calibration %s",
+             (mask & LS_DHT) ? ", DHT11" : "", (mask & LS_I2C) ? ", I2C bus" : "",
+             airSrc, lightName(), ltrOk ? ", UV ltr390" : "", calOk ? "yes" : "no (run tools/factory_cal.py)");
+    if ((mask & LS_I2C) && !shtOk && !ahtOk && !ltrOk) logEvent("Sensors wired to this hub: no I2C sensor answered on %s", I2C_PINS);
+  }
+  xTaskCreate(localTask, "gwlocal", 8192, nullptr, 1, nullptr);   // also answers serial commands when the sensors are off
 }
 
 // ---------------- setup / loop ----------------
@@ -1632,6 +1914,8 @@ void setup() {
   scan->setWindow(80);                                              // 50% duty: leaves Wi-Fi radio time
   scan->start(0, nullptr, false);                                   // scan forever in the background
 
+  localStart();                                                     // sensors wired to the hub (v0.12), after Bluetooth (its address names them)
+
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/live", HTTP_GET, handleLive);
   server.on("/api/history", HTTP_GET, handleHistory);
@@ -1653,7 +1937,7 @@ void setup() {
     server.send(404, "text/plain", "not found");
   });
   server.begin();
-  lastDayPush = lastUpload = millis();
+  lastDayPush = lastUpload = hSlotAt = millis();
   Serial.printf(NODE_FW_BUNDLED ? "Node firmware %s bundled (%lu bytes): nodes are checked and updated from here\n"
                                 : "No node firmware bundled%s: nodes are checked, not updated\n",
                 NODE_FW_VERSION, (unsigned long)NODE_FW_LEN);
@@ -1751,6 +2035,7 @@ void loop() {
 
   // The scan result list is cleared during each upload pause (every 30 s), while the scan is stopped.
   if (now - lastDayPush >= DAY_BUCKET_MS) pushDay();
+  if (now - hSlotAt >= H_SLOT_MS) rotateHealthSlot();
   if (now - lastUpload >= UPLOAD_MS) { lastUpload = now; uploadBatch(); }
 
   static uint32_t lastPrint = 0;

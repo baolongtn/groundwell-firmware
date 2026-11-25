@@ -1,14 +1,23 @@
-# GROUNDWELL v0.9: factory-calibrated nodes, soil, air, light and UV at the plant, a 0-100 health score, hub, cloud history
+# GROUNDWELL v0.12: factory-calibrated nodes, soil, air, light and UV at the plant, sensors on the hub too, a 0-100 health score, cloud history
 
 ```
 [XIAO nRF52840 node] --Bluetooth, every 30 s--> [XIAO ESP32-C6 hub] --HTTPS, every 60 s--> [Cloudflare Worker + D1]
   capacitive probe                               live dashboard on Wi-Fi                     history dashboard + CSV
-  rod probe                                      names, calibration                          health score, every hour in the background
+                                                 names, calibration                          health score, every hour in the background
+                                                 its own probe, air + light (optional)
+                                                 health check of the whole chain (/diag)
   SHT40 / AHT20 / DHT11 air temp + humidity      air + light on every card                   diagnoses, ranges, watering schedule
   LTR390 / VEML7700 / GL5539 light, LTR390 UV                                                air + light history, once a minute
 ```
 
-**Versions:** node firmware v0.11.1 (XIAO and the Nano ESP32 test node), hub firmware v0.11.1 (the hub updates its nodes for you, section 6; diagnostics page, section 5), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
+**Versions:** node firmware v0.12.0 (XIAO and the Nano ESP32 test node), hub firmware v0.12.0 (the hub updates its nodes for you, section 6; diagnostics and health checks, section 5; sensors on the hub, section 4b), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
+
+**New in v0.12**
+- **Sensors on the hub** (section 4b). The hub can carry its own capacitive probe, DHT11 and photoresistor (or SHT40/AHT20 and LTR390 on I2C), wired the same way as a node. It reads them every 30 s with the node's own code and they show up as one more pot, "wired to this hub", on both dashboards. Turn them on at `/setup`; factory calibration works over USB with `factory_cal.py`, as for a node.
+- **Health check of the whole chain** on `http://plants.local/diag` (section 5): one verdict, a tile for each link (nodes, Bluetooth, the hub's sensors, the hub, Wi-Fi, cloud), and a list of findings with what to do. Per node, over the last hour: readings received against expected, dropped readings, timing against the expected interval, copies heard of each reading (link margin), signal, battery, firmware against the version the hub carries, and how far behind the cloud is.
+- **The rod probe is gone.** The capacitive probe is the soil sensor. The node no longer reads or sends rods (the packet is 3 bytes shorter) and pins D2, D3 and D4 are free. When the hub updates a node, that node's rod card disappears on its own. Its old history stays in the cloud; delete it there if you like.
+- **Fix: false node restarts.** The packet id is one byte, and v0.11 took its 255-to-0 wrap (every 256 readings, about every 2 h 8 min) for a restart: it logged "Node restarted", counted it, and checked the node over Bluetooth, about 11 extra connections a day per node on a coin cell. The hub now tells the wrap from a restart, and spots a node that has just been reset by its continuous advertising in its link window.
+- **Smaller hub firmware:** the dashboard and diagnostics pages are stored gzipped (about 27 KB less), so the hub with its sensors and the node firmware inside still fits one update slot.
 
 **New in v0.9**
 - **Battery profile, on USB or battery alike.** The node reads every 30 s instead of 5 s, broadcasts each reading in a 6 s burst and then turns the radio off, and keeps every sensor powered down or in standby between readings. The CPU already slept between readings.
@@ -55,16 +64,13 @@ Live design doc (BOMs, power budget, 10-test validation plan, v1 PCB): [Wireless
 
 ## 1. Wire the node
 
-Both probes, the DHT11 and the light sensor go on one XIAO nRF52840. **Don't use the blue HD-38 comparator board** that came with the rod probes. The rods connect straight to the XIAO, which reverses the current on every reading so the rods never corrode.
+The capacitive probe, the DHT11 and the light sensor go on one XIAO nRF52840. (The rod probe of earlier versions is gone in v0.12: the capacitive probe is the soil sensor, and D2, D3 and D4 are free.)
 
 | Wire | XIAO nRF52840 pin | Notes |
 |---|---|---|
 | Capacitive: black (GND) | GND | |
 | Capacitive: red (VCC) | D1 | Powered only for 150 ms per reading |
 | Capacitive: yellow (AOUT) | D0 / A0 | |
-| Rod wire 1 | D3 | Either rod wire; polarity doesn't matter |
-| Rod wire 2 | D2 / A2 | |
-| 10 kOhm resistor | D2 / A2 to D4 | Reference for the rod divider |
 | DHT11 S / DATA | D6 | Module labels vary; follow the printing on yours |
 | DHT11 + / VCC | 3V3 | |
 | DHT11 - / GND | GND | |
@@ -77,8 +83,6 @@ Both probes, the DHT11 and the light sensor go on one XIAO nRF52840. **Don't use
    cap GND ---- GND
    cap VCC ---- D1
    cap AOUT --- D0/A0
-   rod 1 ------ D3
-   rod 2 ------ D2/A2 ---[10k]--- D4
    DHT DATA --- D6
    DHT VCC ---- 3V3
    DHT GND ---- GND
@@ -86,14 +90,13 @@ Both probes, the DHT11 and the light sensor go on one XIAO nRF52840. **Don't use
    LDR leg 2 -- D5/A5 ---[1k]--- GND
 ```
 
-- **Coming from the photoresistor build (node v0.4):** no wiring changes. Flash v0.6 as it is.
+- **Coming from an earlier build with rods:** unplug the rod probe and its 10 kOhm resistor (D2, D3, D4). Nothing else moves.
 - **Coming from the v0.3 / soil-and-air build:** move the DHT11 data wire from D5 to D6, then add the photoresistor and its 1 kOhm resistor.
 - **Photoresistor placement:** face it up at leaf height, where nothing shades it. Under a translucent cap it reads low.
 - **Photoresistor resistor:** 1 kOhm spreads the readings evenly from about 10 to 100,000 lux. A 10 kOhm works, but its readings bunch up above about 10,000 lux; if you use one, set `LDR_FIXED_OHMS` to 10000.
 - **Trimming the photoresistor:** GL5539 parts vary by up to about ±40%, so treat lux as an estimate. Hold a phone light-meter app beside the node in steady light and adjust `LDR_R10_OHMS` (higher reads brighter) until they agree. The default is the datasheet middle: 75 kOhm at 10 lux, gamma 0.8.
 - **Leaves over the sensor:** the node sits low in the pot, so leaves shade the sensor and the plant's leaves get more light than it reads. The dashboard handles this: set the sensor position once, or run the leaf-level light check (section 5).
 
-- **Rod wires:** the rod cable ends in a 2-pin plug meant for the HD-38 board. Push two male jumper wires into it, or cut the plug off and strip the wires.
 - **DHT11 placement:** mount it about 10 cm above the soil, out of direct sun and away from watering splash. That way it measures the air the leaves sit in, not the damp soil surface. The DHT11 isn't waterproof.
 - **Bare DHT11:** if yours is the bare 4-pin sensor rather than a 3-pin module, add a 10 kOhm pull-up from DATA to 3V3. The module board already has one.
 - **Capacitive probe check:** the timer chip on the probe should be marked **TLC555**. An NE555 misbehaves at 3.3 V.
@@ -105,7 +108,6 @@ Better air, light and UV sensors all share the XIAO's I2C pins, so they need the
 
 | Wire | XIAO nRF52840 pin | Notes |
 |---|---|---|
-| 10 kOhm rod reference resistor | D2 / A2 to **D7** | Moves from D4, which becomes SDA |
 | Every I2C board: SDA | D4 | Daisy-chain STEMMA QT boards, or wire them in parallel |
 | Every I2C board: SCL | D5 | |
 | Every I2C board: VIN / VCC | 3V3 | |
@@ -128,24 +130,19 @@ At boot the node looks for each sensor and uses the best one it finds: SHT4x (0x
    - **"DHT sensor library"** by Adafruit, with its "Adafruit Unified Sensor" dependency
 4. **Select the board:** Tools > Board > **Seeed XIAO nRF52840**.
 5. **Upload** `node/GroundwellNode`. Serial Monitor (115200) prints its address and a line every 30 s, for example:
-   `#12 dt=30000ms  capacitive 2873 (uncal)  rods  412  air 23.5 C 47%RH  light 9258 lux (adc 3108)  VDD 3.30 V`
+   `#12 dt=30000ms  capacitive 2873 (uncal)  air 23.5 C 47%RH  light 9258 lux (adc 3108)  VDD 3.30 V`
    - `dt` is the time since the last reading and should always be about 30000. Type `FAST` for 5 s readings over the next 5 minutes. After factory calibration (section 2b) the capacitive part reads like `capacitive 2283 =  49.9%`.
    - The flash storage for calibration (LittleFS) comes with the Seeed nRF52 core; there's nothing extra to install.
    - If the air sensor isn't answering, the line says `air: dht11 read failed`. The soil readings still go out. A reading the glitch filter holds back shows as `held (jump)`.
    - Photoresistor: cover it with your hand and the adc number should fall toward 0; shine a phone torch on it and it should rise toward 4000. A steady `light 0 lux (adc 0)` in a lit room means a loose leg or a missing 1 kOhm.
 
-Quick check, with the probes in air and then in a cup of water:
-
-| Probe | In air | In water |
-|---|---|---|
-| Capacitive | High, roughly 3000 to 3600 | Drops |
-| Rods | Near 0 | Jumps |
+Quick check, with the probe in air and then in a cup of water: the capacitive count is high in air (roughly 3000 to 3600) and drops in water.
 
 ## 2b. Factory calibration (no plant needed)
 
 Every node is calibrated once, before it ships, against two references anyone can reproduce: open air and water. The node stores the result in its own flash and from then on sends moisture on its own probe scale: 0 = its air reading, 100 = its water reading. That removes the unit-to-unit differences between probes (timer chips, coating thickness, board tolerances). The hub then maps the probe scale to soil with one setting for all nodes (section 4).
 
-**Update the hub to v0.6 first.** A v0.5 hub doesn't understand the calibrated moisture value and would show the rod reading in the capacitive card.
+**Update the hub to v0.6 or later first.** A v0.5 hub doesn't understand the calibrated moisture value.
 
 **Reference conditions** (keep them identical for every unit):
 - **Air:** probe clean and dry, in open air, at least 5 cm from hands, metal and the bench.
@@ -173,7 +170,7 @@ Each unit adds a row to `factory_cal_log.csv`: time, operator, MAC address, firm
 
 **By hand** in Serial Monitor (115200, line ending "Newline"): `INFO`, `CAL AIR`, `CAL WATER`, `CAL SET <air> <water>`, `CAL CLEAR`. After a pass the node prints `CAL RESULT PASS air=3115 water=1452 span=1663 saved`, and every serial line shows the calibrated value, for example `capacitive 2283 =  49.9%`.
 
-**The rod probe isn't factory calibrated.** It measures conductivity, which depends on dissolved salts as much as on water, so a factory point wouldn't carry over to a customer's soil. It is calibrated per pot on the hub, and the product should ship with the capacitive probe only.
+**The hub's own probe** (section 4b) is calibrated the same way: plug the hub in by USB and run the same command. The script finds the hub by itself, says `Hub` instead of `Node`, and the hub keeps the calibration in its settings memory, so updates keep it too.
 
 ## 2c. Optional: a test node on an Arduino Nano ESP32
 
@@ -186,14 +183,11 @@ Short on XIAOs? The same node sketch builds for an **Arduino Nano ESP32**. It se
 | Capacitive: black (GND) | GND | GND |
 | Capacitive: red (VCC) | D1 | **D2** |
 | Capacitive: yellow (AOUT) | D0 / A0 | **A0** |
-| Rod wire 1 | D3 | D3 |
-| Rod wire 2 | D2 / A2 | **A2** |
-| 10 kOhm resistor | D2 / A2 to D4 | **A2** to D4 |
 | DHT11 DATA / + / - | D6 / 3V3 / GND | D6 / 3V3 / GND |
 | Photoresistor leg 1 | D7 | D7 |
 | Photoresistor leg 2 | D5 / A5 | **A3** |
 | 1 kOhm resistor | D5 / A5 to GND | **A3** to GND |
-| I2C sensors (`LIGHT_I2C`) | SDA D4, SCL D5 | SDA **A4**, SCL **A5** (rod reference stays on D4) |
+| I2C sensors (`LIGHT_I2C`) | SDA D4, SCL D5 | SDA **A4**, SCL **A5** |
 
 All the analog inputs sit on A0 to A3, the ESP32-S3's ADC1. D0/D1 are the Nano's serial pins, which is why the probe power moves to D2.
 
@@ -211,7 +205,7 @@ Every push also builds it on GitHub: Actions > latest run > Artifacts > `node-na
 **How it differs from a XIAO node.**
 - **Broadcast only.** Its adverts don't accept connections, so the hub reads them but never links or updates this node. Update it over USB. The hub's node list shows its firmware as unchecked, which is expected.
 - **Power.** It runs on USB and never sleeps (tens of mA, against microamps for the XIAO), so it tells you nothing about battery life. It reports a fixed 3.30 V, because the ESP32 can't measure its own supply, so its battery level always reads full.
-- **ADC.** The ESP32's ADC isn't referenced to the supply. The sketch reads calibrated millivolts and scales them to the 3.3 V rail, so the same math applies, but inputs top out near 3.1 V: the photoresistor saturates around 70,000 lux (direct sun), and very wet rods read a little low. Lux is an estimate on either board.
+- **ADC.** The ESP32's ADC isn't referenced to the supply. The sketch reads calibrated millivolts and scales them to the 3.3 V rail, so the same math applies, but inputs top out near 3.1 V: the photoresistor saturates around 70,000 lux (direct sun). Lux is an estimate on either board.
 
 ## 3. Set up the cloud (free Cloudflare account, about 10 minutes)
 
@@ -263,21 +257,86 @@ The first v0.9.1 flash goes over USB. After that, updates go over Wi-Fi (section
    - Either way, set the **update password** once at `http://plants.local/setup`. Firmware updates stay off until you do.
    - Every 10 s Serial Monitor prints each probe's value and each node's interval, and every minute an `Upload N readings -> HTTP 200` line.
 
+## 4b. Optional: sensors on the hub
+
+The hub can be a pot too. Wire a capacitive probe (and, if you like, a DHT11 and a photoresistor) straight to the hub's XIAO ESP32-C6, the same way as on a node. The hub reads them every 30 s with the node's own code, and they show up as one more pot, "wired to this hub", on the hub page, the cloud dashboard and `/diag`. It keeps listening for its nodes and uploading at the same time.
+
+![Hub wiring](hub-wiring.svg)
+
+| Wire | XIAO ESP32-C6 hub | Same as the node? |
+|---|---|---|
+| Capacitive: black (GND) | GND | yes |
+| Capacitive: red (VCC) | D1 | yes (powered only for 150 ms per reading) |
+| Capacitive: yellow (AOUT) | D0 / A0 | yes |
+| DHT11 S / DATA | D6 | yes |
+| DHT11 + / VCC | 3V3 | yes |
+| DHT11 - / GND | GND | yes |
+| Photoresistor leg 1 | D7 | yes (powered only for a few ms per reading) |
+| Photoresistor leg 2 | **D2 / A2** | no: the node uses D5/A5, which can't read analog on the C6 |
+| 1 kOhm resistor | **D2 / A2** to GND | no, same reason |
+| I2C sensors (optional): SDA, SCL, VIN, GND | D4, D5, 3V3, GND | yes: SHT40 or AHT20 for air, LTR390 for light and UV (no VEML7700 on the hub) |
+
+```
+        XIAO ESP32-C6 (hub)
+   cap GND ---- GND
+   cap VCC ---- D1
+   cap AOUT --- D0/A0
+   DHT DATA --- D6
+   DHT VCC ---- 3V3
+   DHT GND ---- GND
+   LDR leg 1 -- D7
+   LDR leg 2 -- D2/A2 ---[1k]--- GND
+   (optional I2C: SDA D4, SCL D5, 3V3, GND)
+   free: D3, D8, D9, D10
+```
+
+1. **Wire it** as above. Power stays USB-C. Use the TLC555 capacitive probe (an NE555 misbehaves at 3.3 V), and a 10 kOhm pull-up from DATA to 3V3 if your DHT11 is the bare 4-pin part.
+2. **Turn it on:** `http://plants.local/setup` > **Sensors wired to this hub**. Tick the capacitive probe (that switches the hub's sensors on), then what else you fitted: DHT11, photoresistor, I2C. Save; the hub restarts. I2C sensors are found at start, so restart the hub after adding one.
+3. **Factory-calibrate the probe** over USB, exactly like a node (section 2b): `python factory_cal.py --operator BN`. The script finds the hub and says `Hub ...`. Until then the card shows the raw count, and `/diag` says it isn't calibrated.
+4. **Check it:** Serial Monitor prints the same reading line as a node every 30 s (`#12 dt=30000ms  capacitive 2283 =  49.9%  air 23.5 C 47%RH  light 9258 lux (adc 3108)  VDD 3.30 V`), and `/diag` shows a "Sensors wired to this hub" card and a row in the node table.
+
+- **Keep the air sensor away from the board.** The hub's ESP32 runs warm with Wi-Fi and Bluetooth on, a few degrees above the room. Put the DHT11 or SHT40 on a lead about 10 cm long, at leaf height, so it measures the plant's air and not the hub. The same goes for the hub's enclosure: let the sensor sit outside it.
+- **The light sensor** sees what the hub sees: put the photoresistor (or LTR390) on a lead at leaf height, facing up.
+- **Pins left free:** D3, D8, D9, D10 (a pump driver later, say). Keep Tools > **USB CDC On Boot** on **Enabled**, the default: with it off, the serial port moves onto D6 and D7.
+- **Firmware size:** with its sensors and the node firmware inside, the hub still fits one update slot. If a future node firmware grows too big, the GitHub build leaves the hub's I2C sensors out (`HUB_I2C_SENSORS 0`, about 30 KB) and says so in the size report; the capacitive probe, DHT11 and photoresistor keep working.
+
 ## 5. Use it
 
 ### Diagnostics: `http://plants.local/diag`
 
 Admin view > **Diagnostics** (same password as `/update` once one is set). It refreshes every 2 seconds.
 
+**Health (v0.12), at the top.** The page checks every link from the nodes to the cloud against what the firmware expects, and says what to do:
+- **Verdict:** Healthy, Needs attention (nothing broken yet) or Problem (something isn't working), with a count.
+- **The chain:** a tile for each link, in order: **Nodes** (online, and the share of expected readings that came in over the last hour), **Bluetooth** (scan running, adverts per minute), **Hub sensors** (if on), **Hub** (firmware, free memory), **Wi-Fi** (signal), **Cloud** (last upload that worked). Green is fine, amber needs attention, red is a problem.
+- **Findings:** each one with where it is, what's wrong and what to do, worst first. A grey dot is a note (a broadcast-only test node, a reconnect).
+
+What it checks, per node, over the last hour (so a problem from this morning doesn't linger all day):
+
+| Check | Healthy | Needs attention | Problem |
+|---|---|---|---|
+| Readings received vs expected (one per 30 s) | 95% or more | 80 to 95% | under 80%, or offline |
+| Dropped readings (gaps in the packet id) | under 1% | 1 to 5% | over 5% |
+| Timing: middle of the last 16 gaps between readings | within 10% of the expected interval | 10 to 25% off, a gap long enough to miss readings, or two readings too close | over 25% off |
+| Copies heard of each reading (a burst sends 24) | 5 or more | 2 to 5: thin link margin | under 2: at the edge of range |
+| Signal, average | above -82 dBm | -82 to -90 dBm | -90 dBm or weaker |
+| Battery | 2.9 V or more | 2.7 to 2.9 V | under 2.7 V (updates wait) |
+| Firmware vs the version this hub carries | same | older (update pending), newer, not checked yet, or a failed update | stuck in its bootloader |
+| What the node says about itself | | not factory calibrated, not linked, failed link-key attempts, a watchdog restart, air sensor failing over 10% | air sensor not answering at all |
+| Newest reading in the cloud | within 3 upload rounds | later than that | over 15 minutes behind |
+
+And for the rest of the chain: the hub's own probe reading 0 or full scale, I2C ticked but nothing found; the Bluetooth scan stopped or hearing nothing at all; free memory too low for a secure upload, a crash or brownout restart, no node firmware carried; Wi-Fi down or weak, no update password; the clock not set, uploads failing (a wrong ingest key is named as such), the queue filling up, the cloud running behind.
+
 - **Now:** what the hub is doing this moment: listening, checking or updating a node (with %), receiving a hub update, or waiting for Wi-Fi.
 - **Hub:** firmware and trial state, slot use, uptime, why it last restarted, free memory (now, lowest, largest block), the node firmware it carries, the clock.
 - **Wi-Fi:** network, address, signal and channel, which mesh access point it's on, reconnections, setup hotspot, update settings.
 - **Bluetooth:** scanning or paused, adverts per minute from all devices, GROUNDWELL packets and new readings per minute, nodes heard and online.
 - **Cloud:** last upload (HTTP code, how long it took), last success, counts, the last error, readings waiting to send.
-- **Nodes:** one row each: full address, online or offline, last heard and last new reading, readings, adverts and lost packets, measured interval, signal (now, worst, best), battery, firmware, and update status with the next check. **Details** shows what the node reports about itself (node 0.11+): uptime, why it last restarted, readings sent, air read failures, sensors, calibration, link, update window, radio power, connections and failed link-key attempts. **Refresh** asks the hub to check that node at its next burst.
+- **Sensors wired to this hub** (v0.12): what's fitted and found, failed air reads, the probe's raw count, its factory calibration, and the last reading.
+- **Nodes:** one row each: full address, its health and the worst finding, online or offline, last heard, last new reading and newest reading in the cloud, readings received against expected and dropped over the last hour, copies heard of each reading, timing (middle gap, expected, range, last), average signal, battery, firmware against the expected version, and update status with the next check. **Details** lists every health check for that node, then what the node reports about itself (node 0.11+): uptime, why it last restarted, readings sent, air read failures, sensors, calibration, link, update window, radio power, connections and failed link-key attempts. **Refresh** asks the hub to check that node at its next burst.
 - **Probes:** raw value, moisture, calibration and when each was last stored.
 - **Event log:** the last 60 events, newest first: nodes first heard, restarted, offline and back, every node check and update step, Wi-Fi up and down, cloud failures and recoveries, hub updates and trial results.
-- **Download snapshot** saves the whole page as one `.json` file. Send that when something needs debugging.
+- **Download snapshot** saves the whole page, the health findings included, as one `.json` file. Send that when something needs debugging.
 
 
 - **User and Admin tabs** (hub page, top left; remembered per browser):
@@ -401,6 +460,15 @@ Still works, for a node the hub can't reach: press its reset button once, then i
 
 ## Verified before release
 
+- **v0.12 hub, compiled against the real ESP32 core** (esp32 3.3.13, board XIAO_ESP32C6, the two-slot size limit): no new warnings (the 6 it prints were in v0.11.1 too). 1,792,555 bytes without the node firmware; with a 160 KB stand-in node firmware bundled, 1,956,469 of 1,966,080 bytes, so a node firmware up to about 169 KB fits. The rollback test build fits too. With a 185 KB stand-in, the GitHub build's fallback leaves the I2C sensors out and lands at about 1,951,000 bytes.
+- **v0.12 node, compiled against the real ESP32 core** as the Nano ESP32 test node, in both light modes, with no warnings. The XIAO nRF52840 build needs the Seeed core, which couldn't be downloaded here: the GitHub build compiles it on every push.
+- **Shared code:** `tools/check_shared_code.py` confirms the hub's `local_sensors.h` carries the node's capacitive probe, I2C sensor, DHT11, photoresistor, calibration and packet code word for word, and fails when one character differs (tested). The GitHub build runs it.
+- **Hub packet handling:** `tools/hub_packet_test.cpp` runs the hub's actual `handlePacket()`: 300 readings through the 255-to-0 packet id wrap give no restart, no lost readings and no extra node check (the v0.11 rule fails this test 4 ways); a real restart (100 to 1) is counted and triggers a check; dropped readings are counted in the hour window; repeats inside a burst count as copies, not readings; advertising 9 s after a reading flags the link window once; a v0.11 node updated to 0.12 loses its rod card; the hub's own readings don't count as Bluetooth traffic; the hour window clears after 12 rotations.
+- **Packet:** `tools/bthome_roundtrip_test.cpp` passes with the rod count gone (23 bytes at most) and still parses a v0.11 packet that carries one.
+- **Factory calibration:** `factory_cal.py` passes against fake v0.6 and v0.9 nodes and a fake v0.12 hub, fails a bad probe on its water point, and passes on the hub's message when its sensors are off.
+- **Diagnostics page:** run in jsdom against a healthy system (verdict Healthy, every tile green) and one with a problem on every link (weak signal, dropped readings, thin link margin, low battery, an old firmware, a dead air sensor, an offline node, the hub's probe at full scale, a weak Wi-Fi, a wrong ingest key, a filling queue): no script errors, and each finding lands on the right link. Every field the page reads is in `/api/diag`.
+- **Not yet verified on hardware:** the hub's own sensors, the health checks and the gzipped pages haven't run on a real board yet.
+
 - **v0.11.1 hub web update check:** `tools/ota_check_test.cpp` runs the hub's `ota_check.h` against a fake Update library that, like the real one, only advances `progress()` per 4 KB sector. A hub image passes in browser-sized (1436-byte), 1-byte, 20-byte-first, 4 KB and 64 KB pieces; the merged file, a node `.hex`, an ESP32-S3 (Nano) image, a 20-byte file and an empty file are refused. The v0.11.0 check, run the same way, refuses a good image in 1436-byte pieces, which is the bug. The v0.10 `GroundwellHub.ino.bin` that a v0.9.1 hub refused passes. Every GitHub build repeats this on its own output files.
 
 - **v0.9 node firmware:** compiles cleanly against stub headers in both wiring modes (the Seeed nRF52 core couldn't be downloaded for a full build; compile it in Arduino IDE before flashing). `tools/sensor_math_test.cpp` checks the CRC against Sensirion's worked example, the SHT4x and AHT20 conversions, LTR390 scaling, and the glitch filter (one-off spikes dropped, real changes kept). All pass.
@@ -441,6 +509,8 @@ Still works, for a node the hub can't reach: press its reset button once, then i
 
 ## Known limits and next steps
 
+- **The cloud doesn't know a pot is wired to the hub.** The hub's own probe goes up with a 3.30 V supply and 0 dBm signal (like the Nano test node), so the cloud dashboard shows its battery as full. A small cloud change could show "wired" instead.
+- **DHT11 on the hub:** the library pauses interrupts for about 5 ms per read, which the hub's radios tolerate. An SHT40 on I2C avoids it and reads better.
 - **The soil mapping defaults are placeholders** until your lab study replaces `SOIL_DRY_PS` / `SOIL_WET_PS`. Until then, moisture % from factory-calibrated probes is consistent between units but only roughly right in absolute terms.
 - **The cloud refines nothing yet.** A next step is to learn each pot's wet point from the drained peak after each watering, so no one ever presses "Set wet".
 - **Old test history:** readings stored before a node was factory-calibrated are raw counts, so they plot wrongly next to the new probe-scale values. To clear test data: `npx wrangler d1 execute groundwell --remote --command "DELETE FROM readings WHERE hub='home'; DELETE FROM hourly WHERE hub='home';"`
