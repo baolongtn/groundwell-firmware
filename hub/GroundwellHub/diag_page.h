@@ -1,4 +1,4 @@
-// GROUNDWELL hub diagnostics page (v0.12): http://plants.local/diag, data from /api/diag every 2 s.
+// GROUNDWELL hub diagnostics page (v0.12; v0.12.1 adds the crash on record): http://plants.local/diag, data from /api/diag every 2 s.
 // v0.12: a health check of the whole chain (nodes -> Bluetooth -> hub -> Wi-Fi -> cloud) worked out in the page
 // from the raw numbers in /api/diag and what the firmware expects ("expect"), plus the hub's own sensors.
 #pragma once
@@ -163,6 +163,7 @@ function evaluate(d){
  else if(h.heapMin<50000)add(1,'Hub','Free memory dipped to '+kb(h.heapMin)+' (uploads need about 50 KB)','Watch it; a steady fall means a leak worth reporting.');
  if(/crash|watchdog|brownout/.test(h.reset))add(1,'Hub','Last restart: '+h.reset,h.reset=='brownout'?'The power supply sagged: try another USB cable or charger.':'Download a snapshot and report it.');
  if(h.trial)add(-1,'Hub','Firmware '+h.fw+' is on trial','It is kept after 10 minutes on Wi-Fi with a reading heard and an upload accepted.');
+ if(h.crash&&h.crashMine)add(/crash|watchdog/.test(h.reset)?1:-1,'Hub','This firmware has a crash on record: '+h.crash.split(';')[0],'Download a snapshot and send it: it holds the crash addresses.');
  // Wi-Fi
  if(!w.up)add(2,'Wi-Fi',w.ssid?'Down'+(w.downS>=0?' since '+ago(w.downS):''):'No network saved','Readings queue in memory meanwhile. '+(w.ssid?'Check the router; the hub retries every 30 s.':'Set it up on the setup page.'));
  else if(w.rssi<=-88)add(2,'Wi-Fi','Weak signal: '+w.rssi+' dBm','Move the hub closer to a Wi-Fi point, or fit the external antenna.');
@@ -209,6 +210,7 @@ function render(d){
  $('hub').innerHTML=kv([['Firmware',esc(h.fw)+(h.trial?' (on trial)':'')],['Slot',esc(h.slot)+', '+kb(h.sketch)+' of '+kb(h.slotSize)],
   ['Uptime',dur(d.uptimeS)],['Last restart',esc(h.reset)],['Free memory',kb(h.heap)+' (lowest '+kb(h.heapMin)+', largest block '+kb(h.heapBlock)+')'],
   ['Node firmware carried',h.nodeFw?esc(h.nodeFw)+' ('+kb(h.nodeFwLen)+')':'none'],h.note?['Last update',esc(h.note)]:null,
+  h.crash?['Crash on record',esc(h.crash)+' <span class=small>('+(h.crashMine?'this firmware':'another build')+')</span>']:null,
   ['Clock',c.clock?new Date(d.epoch*1000).toLocaleString():dot(false)+'not set yet (no internet time)']]);
  $('sens').innerHTML=s.on?kv([['Address',esc(s.mac)+' (shown as a node)'],['Fitted','capacitive probe'+(s.dht?', DHT11':'')+(s.ldr?', photoresistor':'')+(s.i2c?', I2C bus':'')],
   ['Air',esc(s.air)+(s.airFail?' · '+s.airFail+' failed reads':'')],['Light',esc(s.light)+(s.uv?' + UV':'')+(s.light=='ldr'?' (adc '+s.ldrAdc+')':'')],
@@ -222,7 +224,8 @@ function render(d){
  $('ble').innerHTML=kv([['Scan',b.scanning?dot(true)+'listening (100 ms interval, 50 ms window)':dot(false,true)+'paused'+(b.job?' for a node job':'')],
   b.job?['Node job','node '+esc(b.jobNode)+', running '+b.jobS+' s']:null,['Adverts, all devices',b.all+' · '+rate('all')],
   ['GROUNDWELL packets',b.gw+' · '+rate('gw')],['New readings',b.fresh+' · '+rate('fresh')],
-  ['Nodes',d.nodes.filter(n=>!n.local).length+' heard, '+d.nodes.filter(n=>!n.local&&n.online).length+' online']]);
+  ['Nodes',d.nodes.filter(n=>!n.local).length+' heard, '+d.nodes.filter(n=>!n.local&&n.online).length+' online'],
+  ['Device list','emptied every 10 s ('+b.clears+' times)']]);
  $('cloud').innerHTML=kv([['Upload',c.on?esc(c.url):dot(false)+'off (no URL)'],
   c.on?['Last try',c.lastS<0?'not yet':(c.code==200?dot(true):dot(false))+'HTTP '+c.code+', '+ago(c.lastS)+' ('+c.ms+' ms)']:null,
   c.on?['Last success',ago(c.okS)+(c.streak?' · '+c.streak+' failed since':'')]:null,c.err?['Last error',esc(c.err)]:null,['Uploads',c.ok+' OK, '+c.fail+' failed'],
