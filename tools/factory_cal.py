@@ -114,6 +114,16 @@ def ask(prompt, auto):
     input(prompt + "  Press Enter when ready... ")
 
 
+def fast(node):
+    """Firmware 0.9+ reads every 30 s to save power. FAST switches it to 5 s for 5 minutes, starting after
+    the reading that's already scheduled (up to 30 s away), so wait that one out: what follows comes every 5 s.
+    Older nodes answer "ERR unknown command" and already run at 5 s."""
+    reply = node.command("FAST", r"^(FAST|ERR)", 3)
+    if reply and reply.startswith("FAST"):
+        print("  waiting for the node to switch to 5 s readings (up to 30 s)...")
+        node.readings(1, 35)
+
+
 def run_unit(port, args):
     row = {k: "" for k in LOG_FIELDS}
     row["time_utc"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -126,12 +136,10 @@ def run_unit(port, args):
             return fail(row, "no_reply", "The node didn't answer INFO. Is it running firmware 0.6 or later?")
         row["mac"], row["fw"] = kv(info, "mac"), kv(info, "fw")
         print(f"Node {row['mac']}  firmware {row['fw']}  calibrated: {kv(info, 'cal')}")
-        # Firmware 0.9+ reads every 30 s to save power; FAST switches it to 5 s for the next 5 minutes.
-        # Older nodes answer "ERR unknown command" and already run at 5 s.
-        node.command("FAST", r"^(FAST|ERR)", 3)
         if kv(info, "cal") == "yes" and not args.force:
             if args.auto is None and input("Already calibrated. Recalibrate? [y/N] ").strip().lower() != "y":
                 return fail(row, "skipped", "Left as it was.")
+        fast(node)
 
         # 1. Timing: the node must send one reading every 5 s.
         print(f"Checking timing for {args.cadence_s:.0f} s...")
@@ -175,6 +183,7 @@ def run_unit(port, args):
 
         # 4. Verify: still in water it must read near 100 %. Each verify skips the first reading,
         #    which may have been taken before or while the probe moved.
+        fast(node)                                        # FAST lasts 5 minutes; slow prompts could outlast it
         rd = node.readings(3, 18)[1:]
         pcts = [r[3] for r in rd if r[3] is not None]
         if not pcts:
@@ -186,8 +195,7 @@ def run_unit(port, args):
 
         # 5. Verify: back in air it must read near 0 %
         ask("VERIFY: take the probe out, dry it, hold it in open air again.", args.auto)
-        node.s.reset_input_buffer()
-        node.buf = b""
+        fast(node)
         rd = node.readings(3, 18)[1:]
         pcts = [r[3] for r in rd if r[3] is not None]
         if not pcts:
