@@ -1,6 +1,6 @@
 # groundwell-firmware
 
-Firmware for GROUNDWELL: the XIAO nRF52840 sensor node and the XIAO ESP32-C6 hub. Current version: **node v0.10.0, hub v0.10.0**. Update the hub over the air and it updates its nodes over Bluetooth ([SETUP.md section 6](docs/SETUP.md#6-update-over-the-air)).
+Firmware for GROUNDWELL: the XIAO nRF52840 sensor node and the XIAO ESP32-C6 hub. Current version: **node v0.11.0, hub v0.11.0**. Update the hub over the air and it updates its nodes over Bluetooth ([SETUP.md section 6](docs/SETUP.md#6-update-over-the-air)). Hub and node state, traffic and an event log: `http://plants.local/diag`.
 
 The cloud (Cloudflare Worker + D1, dashboard, health engine) lives in [groundwell-cloud](https://github.com/baolongtn/groundwell-cloud).
 

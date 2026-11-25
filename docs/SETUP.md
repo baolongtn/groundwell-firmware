@@ -8,7 +8,7 @@
   LTR390 / VEML7700 / GL5539 light, LTR390 UV                                                air + light history, once a minute
 ```
 
-**Versions:** node firmware v0.10.0, hub firmware v0.10.0 (the hub updates its nodes for you, section 6), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
+**Versions:** node firmware v0.11.0, hub firmware v0.11.0 (the hub updates its nodes for you, section 6; diagnostics page, section 5), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
 
 **New in v0.9**
 - **Battery profile, on USB or battery alike.** The node reads every 30 s instead of 5 s, broadcasts each reading in a 6 s burst and then turns the radio off, and keeps every sensor powered down or in standby between readings. The CPU already slept between readings.
@@ -227,6 +227,21 @@ The first v0.9.1 flash goes over USB. After that, updates go over Wi-Fi (section
 
 ## 5. Use it
 
+### Diagnostics: `http://plants.local/diag`
+
+Admin view > **Diagnostics** (same password as `/update` once one is set). It refreshes every 2 seconds.
+
+- **Now:** what the hub is doing this moment: listening, checking or updating a node (with %), receiving a hub update, or waiting for Wi-Fi.
+- **Hub:** firmware and trial state, slot use, uptime, why it last restarted, free memory (now, lowest, largest block), the node firmware it carries, the clock.
+- **Wi-Fi:** network, address, signal and channel, which mesh access point it's on, reconnections, setup hotspot, update settings.
+- **Bluetooth:** scanning or paused, adverts per minute from all devices, GROUNDWELL packets and new readings per minute, nodes heard and online.
+- **Cloud:** last upload (HTTP code, how long it took), last success, counts, the last error, readings waiting to send.
+- **Nodes:** one row each: full address, online or offline, last heard and last new reading, readings, adverts and lost packets, measured interval, signal (now, worst, best), battery, firmware, and update status with the next check. **Details** shows what the node reports about itself (node 0.11+): uptime, why it last restarted, readings sent, air read failures, sensors, calibration, link, update window, radio power, connections and failed link-key attempts. **Refresh** asks the hub to check that node at its next burst.
+- **Probes:** raw value, moisture, calibration and when each was last stored.
+- **Event log:** the last 60 events, newest first: nodes first heard, restarted, offline and back, every node check and update step, Wi-Fi up and down, cloud failures and recoveries, hub updates and trial results.
+- **Download snapshot** saves the whole page as one `.json` file. Send that when something needs debugging.
+
+
 - **User and Admin tabs** (hub page, top left; remembered per browser):
   - **User** is the full v0.5 dashboard without the calibration panels.
   - **Admin** adds "Calibrate and alert level" on every card.
@@ -389,7 +404,7 @@ Still works, for a node the hub can't reach: press its reset button once, then i
 - **Calibration source:** "Set dry/wet = now" uses the latest reading the hub received, up to 5 s old. Wait for one update after moving a probe.
 - **Setup hotspot password:** every hub uses the same default (`SETUP_AP_PASS`). A product needs one per unit, printed on its label.
 - **Updates aren't signed yet.** The hub's `/update` and Arduino IDE uploads need the update password, and a node accepts an update only from its linked hub (or anyone, in the 10 minutes after a reset), but nothing checks who built the file. Next step: the hub pulls signed builds from Cloudflare.
-- **The hub is 94% full** (1.86 of 1.97 MB) now that it carries the node firmware. The next step moves the node file out of the hub: the hub downloads it from Cloudflare when a node needs it.
+- **The hub is 95% full** (1.88 of 1.97 MB) now that it carries the node firmware. The next step moves the node file out of the hub: the hub downloads it from Cloudflare when a node needs it.
 - **Linking trusts the first hub.** A node links to whichever hub reaches it first in its 10-minute window, which could be a neighbor's GROUNDWELL hub. Pressing reset with your hub nearby links it back.
 - **The diagnoses are heuristics, not lab tests.** They're built on standard plant physics (transpiration driven by VPD and light) and tested against a simulator, not yet against real failing plants. Treat "root rot risk" as "go look at the roots".
 - **Lux is not plant light.** The conversion assumes daylight. Under white LED grow lights, the light score reads about 20% high.
