@@ -98,8 +98,9 @@
     corrode, and soil polarization cancels out.
 
   Test node on an Arduino Nano ESP32 (bench use, until more XIAOs arrive)
-    The same sketch also builds for the Arduino Nano ESP32: board package "esp32" 3.x (the one the hub
-    uses), board "Arduino Nano ESP32", Pin Numbering "By Arduino pin (default)". It sends the same BTHome
+    The same sketch also builds for the Arduino Nano ESP32, with either board package: "esp32" 3.x by
+    Espressif (the one the hub uses) or Arduino's own "Arduino ESP32 Boards" (2.0.x), board "Arduino Nano
+    ESP32", Pin Numbering "By Arduino pin (default)". It sends the same BTHome
     packet, so the hub shows it like any other node, and it takes the same serial commands, so
     tools/factory_cal.py calibrates it the same way. What's different:
       - Its adverts are non-connectable. The hub reads them but never connects, so it never links or
@@ -1037,7 +1038,11 @@ static void advertise(const uint8_t *svc, uint8_t len) {
   memcpy(raw + n, svc, len);
   n += len;
   BLEAdvertisementData d;
-  d.addData((char *)raw, n);
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  d.addData((char *)raw, n);                         // Espressif's "esp32" package 3.x
+#else
+  d.addData(std::string((char *)raw, n));            // Arduino's "Arduino ESP32 Boards" package (2.0.x)
+#endif
   adv->stop();
   adv->setAdvertisementData(d);
   adv->start();
