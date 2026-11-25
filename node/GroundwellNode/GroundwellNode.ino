@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL sensor node v0.11.1  (two soil probes + air temperature/humidity + light + UV, one board)
+  GROUNDWELL sensor node v0.12.0  (capacitive soil probe + air temperature/humidity + light + UV, one board)
   Board:  Seeed XIAO nRF52840 (plain or Sense)
           Arduino IDE: Boards Manager URL
             https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
@@ -17,21 +17,22 @@
     From a phone: for DFU_WINDOW_MS (10 min) after power-up or a reset, the node advertises continuously and
     accepts an update without the key: nRF Connect for Mobile > connect to "GW" > DFU > GroundwellNode.ino.zip.
     Serial command UNLINK forgets the link key.
+  v0.12: the rod probe is gone (the capacitive probe is the soil sensor), so the packet is 3 bytes shorter and
+  pins D2, D3 and D4 are free.
   Diagnostics (v0.11): a read-only characteristic reports uptime, why it last restarted, readings sent,
   air-sensor read failures, sensors, calibration, link, update window, radio power, interval, connections
   and failed link-key attempts. The hub reads it at each check and shows it on http://plants.local/diag.
 
   What it does
-    Every REPORT_MS (30 s) it reads both probes, air temperature/humidity and light, then broadcasts one
+    Every REPORT_MS (30 s) it reads the capacitive probe, air temperature/humidity and light, then broadcasts one
     BTHome v2 packet for ADV_BURST_S (6 s) and lets the radio sleep until the next reading:
       packet id, air temperature + humidity (best sensor found; skipped if a read fails or looks like a glitch),
       illuminance in lux, supply voltage (the hub and cloud derive battery level from it),
       capacitive probe: factory-calibrated moisture (BTHome moisture %, 0 = air, 100 = water)
                         or, before factory calibration, its raw count (0..4095, LOWER = wetter)
-      rod probe:        raw count (0..4095, HIGHER = wetter)
       UV index:         only with an LTR390 fitted
-    Low power, on USB or battery alike: the CPU sleeps between readings, the capacitive probe, photoresistor and
-    rod drive are powered only while reading, the I2C sensors sit in standby between readings, and the radio
+    Low power, on USB or battery alike: the CPU sleeps between readings, the capacitive probe and photoresistor
+    are powered only while reading, the I2C sensors sit in standby between readings, and the radio
     is off except for the 6 s burst after each reading.
 
   Air and light sensors (LIGHT_I2C wiring): found automatically at boot, best first
@@ -54,9 +55,9 @@
     The calibration lives on the node, so a node ships calibrated with no plant and no hub settings.
 
   Wiring choice: pick one with LIGHT_SENSOR in the settings below.
-    LIGHT_LDR (default)  GL5539 photoresistor on D7 + A5, rod reference on D4, DHT11 on D6
+    LIGHT_LDR (default)  GL5539 photoresistor on D7 + A5, DHT11 on D6
     LIGHT_I2C            I2C bus on D4 (SDA) / D5 (SCL) for any mix of SHT4x, AHT20, VEML7700, LTR390;
-                         rod reference moves to D7; the photoresistor is not used (the LTR390 or VEML7700
+                         the photoresistor is not used (D5 is the I2C clock; the LTR390 or VEML7700
                          measures light); the DHT11 on D6 is still used if no SHT4x/AHT20 is found.
   The packet, hub and cloud are identical either way.
 
@@ -65,12 +66,6 @@
       black  GND   -> XIAO GND
       red    VCC   -> XIAO D1    (powered only while reading)
       yellow AOUT  -> XIAO D0/A0
-    Rod probe (2-wire cable; the HD-38 comparator board is NOT used)
-      rod wire 1   -> XIAO D3                     (drive A)
-      rod wire 2   -> XIAO D2/A2                  (sense)
-      10 kOhm      -> between XIAO D2/A2 and D4   (reference, drive B)   LIGHT_LDR
-                      between XIAO D2/A2 and D7                          LIGHT_I2C     
-      Rod polarity doesn't matter.
     DHT11 module (3 pins, labels vary: S/DATA, +/VCC, -/GND)
       S / DATA     -> XIAO D6                                            (was D5 before v0.4)
       + / VCC      -> XIAO 3V3
@@ -83,7 +78,7 @@
       Either leg; polarity doesn't matter. Face it up at leaf height.
     I2C breakouts (LIGHT_I2C): SHT40 (Adafruit 4885), AHT20 (4566), VEML7700 (4162), LTR390 (4831), any mix.
       All of them share the same four wires (daisy-chain STEMMA QT boards, or wire them in parallel):
-      SDA          -> XIAO D4    (the XIAO's I2C pins, which is why the rod reference moves to D7)
+      SDA          -> XIAO D4    (the XIAO's I2C pins)
       SCL          -> XIAO D5
       VIN / VCC    -> XIAO 3V3
       GND          -> XIAO GND
@@ -91,11 +86,6 @@
       away from the board and out of direct sun. Anything not found at boot is simply left out of the packet.
     Power: USB-C or a battery; the firmware runs the same low-power cycle on both. If you fit a coin cell to
     the BAT pads, remove it before plugging USB in (the onboard charger would try to charge it).
-
-  Why the rods are driven this way
-    The current through the soil is reversed on every reading and both phases
-    last the same time, so there is no net DC: the rods don't electroplate or
-    corrode, and soil polarization cancels out.
 
   Test node on an Arduino Nano ESP32 (bench use, until more XIAOs arrive)
     The same sketch also builds for the Arduino Nano ESP32, with either board package: "esp32" 3.x by
@@ -109,17 +99,16 @@
         It reports a fixed 3.30 V supply, because the ESP32 can't measure its own rail.
       - Its ADC isn't referenced to the supply like the nRF52840's. The sketch reads calibrated
         millivolts and scales them to the 3.3 V rail, so the same 0..4095 math holds, but the input
-        tops out near 3.1 V: the photoresistor saturates around 70,000 lux and very wet rods read a
-        little low. Run factory calibration on it; the capacitive probe then reads on the same scale.
+        tops out near 3.1 V: the photoresistor saturates around 70,000 lux. Run factory calibration on it;
+        the capacitive probe then reads on the same scale.
     Nano ESP32 wiring (every analog input on ADC1, A0..A3; D and A pins are separate pins on the Nano)
       Capacitive   black GND -> GND, red VCC -> D2, yellow AOUT -> A0
-      Rods         wire 1 -> D3, wire 2 -> A2, 10 kOhm between A2 and D4
       DHT11        DATA -> D6, VCC -> 3V3 (never 5V: the Nano's pins are 3.3 V only), GND -> GND
       GL5539       leg 1 -> D7, leg 2 -> A3, 1 kOhm between A3 and GND
-      I2C sensors  (LIGHT_I2C) SDA -> A4, SCL -> A5; the rod reference stays on D4
+      I2C sensors  (LIGHT_I2C) SDA -> A4, SCL -> A5
 */
 
-static const char *FW_VERSION = "0.11.1";
+static const char *FW_VERSION = "0.12.0";
 
 // ---------------- light sensor choice ----------------
 #define LIGHT_LDR      1                         // GL5539 photoresistor + DHT11, no I2C (the parts in hand)
@@ -197,13 +186,8 @@ static const char    *CAL_FILE      = "/gwcal.bin";
 #if GW_NRF52
 static const int PIN_CAP_AOUT  = A0;   // D0
 static const int PIN_CAP_POWER = D1;
-static const int PIN_ROD_SENSE = A2;   // D2
-static const int PIN_ROD_A     = D3;
 static const int PIN_DHT       = D6;
-#if LIGHT_SENSOR == LIGHT_I2C
-static const int PIN_ROD_REF   = D7;   // through the 10k to D2 (D4/D5 are the I2C pins)
-#else
-static const int PIN_ROD_REF   = D4;   // through the 10k to D2
+#if LIGHT_SENSOR != LIGHT_I2C
 static const int PIN_LDR_POWER = D7;
 static const int PIN_LDR_SENSE = A5;   // D5
 #endif
@@ -214,9 +198,6 @@ __attribute__((unused)) static const char *I2C_PINS = "D4/D5";
 // and are the I2C pins. D0/D1 are the Nano's UART, so the probe power moves to D2.
 static const int PIN_CAP_AOUT  = A0;
 static const int PIN_CAP_POWER = D2;
-static const int PIN_ROD_SENSE = A2;
-static const int PIN_ROD_A     = D3;
-static const int PIN_ROD_REF   = D4;   // through the 10k to A2, with either wiring (I2C is on A4/A5)
 static const int PIN_DHT       = D6;
 #if LIGHT_SENSOR != LIGHT_I2C
 static const int PIN_LDR_POWER = D7;
@@ -289,29 +270,6 @@ static uint16_t readCapacitive() {
   uint16_t v = avgRead(PIN_CAP_AOUT, OVERSAMPLE);
   digitalWrite(PIN_CAP_POWER, LOW);
   return v;                                          // 0..4095 of VDD (ratiometric)
-}
-
-// Rod probe: two equal phases with opposite polarity.
-//   phase 1: A=HIGH, REF=LOW  -> v1 = Rref/(Rsoil+Rref)
-//   phase 2: A=LOW,  REF=HIGH -> v2 = Rsoil/(Rsoil+Rref)
-// wetness = average of v1 and (1 - v2); 0 = open circuit (dry), 4095 = short (wet).
-static uint16_t readRods() {
-  pinMode(PIN_ROD_A, OUTPUT);
-  pinMode(PIN_ROD_REF, OUTPUT);
-
-  digitalWrite(PIN_ROD_A, HIGH);
-  digitalWrite(PIN_ROD_REF, LOW);
-  delayMicroseconds(300);
-  uint16_t v1 = avgRead(PIN_ROD_SENSE, 8);
-
-  digitalWrite(PIN_ROD_A, LOW);
-  digitalWrite(PIN_ROD_REF, HIGH);
-  delayMicroseconds(300);
-  uint16_t v2 = avgRead(PIN_ROD_SENSE, 8);
-
-  pinMode(PIN_ROD_A, INPUT);                         // both high-Z: no current between readings
-  pinMode(PIN_ROD_REF, INPUT);
-  return (uint16_t)(((uint32_t)v1 + (4095u - v2)) / 2u);
 }
 
 // Supply voltage through the SAADC's internal VDD channel (no divider, no leakage).
@@ -738,13 +696,14 @@ static void serviceSerial() {
 // ---------------- BTHome v2 packet ----------------
 // Service data layout (all little-endian), objects in ascending ID order:
 //   D2 FC | 40 | 00 pid | [02 temp*100 (s16) | 03 RH*100 (u16)] | [05 lux*100 (u24)]
-//         | 0C mV (u16) | [14 moisture*100 (u16), calibrated capacitive] | [3D cap raw (u16), uncalibrated] | 3D rods (u16)
+//         | 0C mV (u16) | [14 moisture*100 (u16), calibrated capacitive] | [3D cap raw (u16), uncalibrated]
 //         | [46 UV index*10 (u8)]
+// v0.12: no rod probe count (it was a second 3D object after the capacitive probe).
 // capPct is the probe scale x100 (0..10000) when calibrated, or -1 to send the raw capacitive count instead.
 // Battery % (0x01) is no longer sent (v0.9): the supply voltage carries the same information, and the
 // two bytes make room for the UV index inside the 31-byte legacy advert.
 static uint8_t buildBTHome(uint8_t *b, uint8_t pid, bool airOk, float tempC, float rh,
-                           bool luxOk, float lux, float vdd, int32_t capPct, uint16_t cap, uint16_t rods,
+                           bool luxOk, float lux, float vdd, int32_t capPct, uint16_t cap,
                            bool uvOk, float uvi) {
   uint8_t n = 0;
   uint16_t mv = (uint16_t)lroundf(vdd * 1000.0f);
@@ -769,12 +728,11 @@ static uint8_t buildBTHome(uint8_t *b, uint8_t pid, bool airOk, float tempC, flo
   } else {
     b[n++] = 0x3D; b[n++] = (uint8_t)(cap & 0xFF); b[n++] = (uint8_t)(cap >> 8);
   }
-  b[n++] = 0x3D; b[n++] = (uint8_t)(rods & 0xFF);b[n++] = (uint8_t)(rods >> 8);
   if (uvOk) {
     float u = uvi * 10.0f;
     b[n++] = 0x46; b[n++] = (uint8_t)(u <= 0 ? 0 : u >= 255.0f ? 255 : lroundf(u));
   }
-  return n;                                          // 26 bytes with air + light + UV (the legacy advert's limit), 14 with none
+  return n;                                          // 23 bytes with air + light + UV (the legacy advert allows 26), 11 with none
 }
 // ---- end BTHome packet (host-tested: tools/bthome_roundtrip_test.cpp) ----
 
@@ -1064,8 +1022,6 @@ void setup() {
 
   pinMode(PIN_CAP_POWER, OUTPUT_STRONG);             // the probe pulls a few mA
   digitalWrite(PIN_CAP_POWER, LOW);
-  pinMode(PIN_ROD_A, INPUT);
-  pinMode(PIN_ROD_REF, INPUT);
   dht.begin();
   storeBegin();
   loadCal();
@@ -1123,7 +1079,6 @@ void loop() {
   if (nextAt == 0) nextAt = millis();
 
   uint16_t cap  = readCapacitive();
-  uint16_t rods = readRods();
   float vdd     = readVDD();
   lastVdd       = vdd;
   float tempC = 0, rh = 0;
@@ -1139,7 +1094,7 @@ void loop() {
   int32_t capPct = calOk ? (int32_t)probeScaleX100(cap) : -1;
 
   uint8_t svc[31];
-  uint8_t len = buildBTHome(svc, ++packetId, airOk, tempC, rh, luxOk, lux, vdd, capPct, cap, rods, uvOk, uvi);
+  uint8_t len = buildBTHome(svc, ++packetId, airOk, tempC, rh, luxOk, lux, vdd, capPct, cap, uvOk, uvi);
   advertise(svc, len);
   uint32_t now = millis(), dt = lastSentAt ? now - lastSentAt : 0;
   lastSentAt = now;
@@ -1157,7 +1112,7 @@ void loop() {
 #endif
   if (capPct >= 0) snprintf(capTxt, sizeof capTxt, "capacitive %4u = %5.1f%%", cap, capPct / 100.0f);
   else             snprintf(capTxt, sizeof capTxt, "capacitive %4u (uncal)", cap);
-  Serial.printf("#%u dt=%lums  %s  rods %4u  %s  %s  VDD %.2f V\n", packetId, (unsigned long)dt, capTxt, rods, airTxt, luxTxt, vdd);
+  Serial.printf("#%u dt=%lums  %s  %s  %s  VDD %.2f V\n", packetId, (unsigned long)dt, capTxt, airTxt, luxTxt, vdd);
 
   // Absolute schedule: the next reading is due REPORT_MS after the last one was due, however long this
   // one took. The wait is a loop on the clock, so it can't end early, and it answers serial commands.

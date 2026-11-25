@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GROUNDWELL factory calibration fixture (node firmware 0.6+).
+GROUNDWELL factory calibration fixture (node firmware 0.6+, and the capacitive probe wired to a hub 0.12+).
 
 Runs one node (or a batch) through: identify -> timing check -> air point -> water point
 -> verify in water -> verify back in air, then appends one row per unit to a CSV log.
@@ -35,6 +35,7 @@ WATER_MIN_PCT = 95.0          # verify step: probe in water must read at least t
 AIR_MAX_PCT = 5.0             # verify step: probe back in air must read at most this
 SEEED_VID = 0x2886
 ARDUINO_VID = 0x2341          # Arduino Nano ESP32 test node
+ESPRESSIF_VID = 0x303A        # XIAO ESP32-C6 hub (its USB port is the chip's own, with Espressif's ID)
 LOG_FIELDS = ["time_utc", "operator", "mac", "fw", "result", "reason", "air", "water", "span",
               "air_sd", "water_sd", "cadence_ms_min", "cadence_ms_max", "verify_water_pct", "verify_air_pct"]
 
@@ -93,11 +94,11 @@ class Node:
 
 
 def find_port():
-    ports = [p for p in serial.tools.list_ports.comports() if p.vid in (SEEED_VID, ARDUINO_VID)]
+    ports = [p for p in serial.tools.list_ports.comports() if p.vid in (SEEED_VID, ARDUINO_VID, ESPRESSIF_VID)]
     if len(ports) == 1:
         return ports[0].device
     if not ports:
-        sys.exit("No node found (XIAO or Nano ESP32). Plug the node in by USB, or pass --port (for example --port COM7).")
+        sys.exit("No node found (XIAO, Nano ESP32 or hub). Plug the node in by USB, or pass --port (for example --port COM7).")
     sys.exit("More than one node is plugged in: " + ", ".join(p.device for p in ports) + ". Pass --port.")
 
 
@@ -131,11 +132,13 @@ def run_unit(port, args):
     node = Node(port, args.verbose)
     try:
         time.sleep(1.5)                                   # opening the port can reset some boards
-        info = node.command("INFO", r"^INFO ", 8)
+        info = node.command("INFO", r"^(INFO|ERR) ", 8)
+        if info and info.startswith("ERR"):
+            return fail(row, "refused", info)              # a hub with its sensors switched off says so
         if not info:
             return fail(row, "no_reply", "The node didn't answer INFO. Is it running firmware 0.6 or later?")
         row["mac"], row["fw"] = kv(info, "mac"), kv(info, "fw")
-        print(f"Node {row['mac']}  firmware {row['fw']}  calibrated: {kv(info, 'cal')}")
+        print(f"{'Hub' if kv(info, 'board') == 'hub' else 'Node'} {row['mac']}  firmware {row['fw']}  calibrated: {kv(info, 'cal')}")
         if kv(info, "cal") == "yes" and not args.force:
             if args.auto is None and input("Already calibrated. Recalibrate? [y/N] ").strip().lower() != "y":
                 return fail(row, "skipped", "Left as it was.")

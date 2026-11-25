@@ -16,12 +16,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Host tests (link key HMAC, node update protocol, hub web update check)
+      - name: Host tests (link key HMAC, node update protocol, hub web update check, packets, hub packet handling)
         run: |
           cmp node/GroundwellNode/gw_hmac.h hub/GroundwellHub/gw_hmac.h || { echo "gw_hmac.h differs between node and hub"; exit 1; }
+          # The hub reads its own sensors with the node's code (local_sensors.h): fail if the copies drift apart.
+          python3 tools/check_shared_code.py
           g++ -O2 -Wall -Wextra -o /tmp/hmac_test tools/hmac_test.cpp && /tmp/hmac_test
           g++ -O2 -Wall -Wextra -o /tmp/node_dfu_test tools/node_dfu_test.cpp && /tmp/node_dfu_test
           g++ -O2 -Wall -Wextra -o /tmp/ota_check_test tools/ota_check_test.cpp && /tmp/ota_check_test
+          cd tools
+          python3 -c "s=open('../node/GroundwellNode/GroundwellNode.ino').read(); a=s.index('static uint8_t buildBTHome('); b=s.index('// ---- end BTHome packet'); open('node_build.inc','w').write(s[a:b])"
+          g++ -std=c++17 -Wall -o /tmp/roundtrip bthome_roundtrip_test.cpp && /tmp/roundtrip
+          python3 hub_packet_test_extract.py
+          g++ -std=c++17 -Wall -Wno-unused-function -Wno-volatile -o /tmp/hubpkt hub_packet_test.cpp && /tmp/hubpkt
 
       - uses: arduino/setup-arduino-cli@v2
 
@@ -71,23 +78,34 @@ jobs:
             cp build/node-nano-esp32/GroundwellNode.ino.merged.bin build/node-nano-esp32/GroundwellNode-nano-esp32.merged.bin
           fi
 
-      - name: Bundle the node firmware into the hub
+      - name: Bundle the node firmware into the hub (and gzip the hub's pages)
         run: python3 tools/make_node_fw_h.py build/node/GroundwellNode.ino.zip
 
       - name: Build hub (XIAO ESP32-C6)
         run: |
           # No secrets.h in CI: the hub opens its setup hotspot on first boot.
           # partitions.csv in the sketch folder gives two 1,966,080-byte app slots; fail the build if the hub outgrows one.
-          arduino-cli compile --warnings default --fqbn esp32:esp32:XIAO_ESP32C6:PartitionScheme=huge_app --build-property upload.maximum_size=1966080 \
-            --output-dir build/hub hub/GroundwellHub 2>&1 | tee build/hub.log
+          # If the hub, node firmware inside, outgrows one slot, build it without the hub's own I2C sensors
+          # (HUB_I2C_SENSORS=0, about 30 KB smaller) rather than fail: a warning and the size report say so.
+          build_hub() {
+            arduino-cli compile --warnings default --fqbn esp32:esp32:XIAO_ESP32C6:PartitionScheme=huge_app --build-property upload.maximum_size=1966080 \
+              --build-property "compiler.cpp.extra_flags=$1" --output-dir build/hub hub/GroundwellHub 2>&1 | tee build/hub.log
+          }
+          if ! build_hub ""; then
+            grep -qi "too big" build/hub.log || exit 1
+            echo "::warning::The hub with the node firmware inside is too big for one update slot: built without the hub's I2C sensors (HUB_I2C_SENSORS=0)"
+            echo "HUB_FLAGS=-DHUB_I2C_SENSORS=0" >> "$GITHUB_ENV"
+            build_hub "-DHUB_I2C_SENSORS=0"
+          fi
           test -f build/hub/GroundwellHub.ino.bin
           grep -qa app1 build/hub/GroundwellHub.ino.partitions.bin   # the two-slot table made it into the build
           grep -q "Node firmware %s bundled" hub/GroundwellHub/GroundwellHub.ino
+          test -f hub/GroundwellHub/pages_gz.h      # the gzipped pages made it in (about 30 KB less flash)
 
       - name: Build hub rollback test (crashes 20 s after boot)
         run: |
           arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6:PartitionScheme=huge_app --build-property upload.maximum_size=1966080 \
-            --build-property "compiler.cpp.extra_flags=-DGW_CRASH_TEST=1" \
+            --build-property "compiler.cpp.extra_flags=-DGW_CRASH_TEST=1 ${HUB_FLAGS:-}" \
             --output-dir build/hub-crashtest hub/GroundwellHub > build/hub-crashtest.log 2>&1 || { cat build/hub-crashtest.log; exit 1; }
           mv build/hub-crashtest/GroundwellHub.ino.bin build/hub-crashtest/GroundwellHub-crashtest.bin
 
@@ -113,9 +131,10 @@ jobs:
             echo "## Firmware size"
             echo "| | Bytes | Note |"
             echo "|---|---|---|"
-            echo "| Hub app (with the node firmware inside) | $HUB | OTA slot holds $OTA_SLOT: $(( HUB * 100 / OTA_SLOT ))% of it |"
-            echo "| Node app | $NODE | |"
+            echo "| Hub app (with the node firmware inside) | $HUB | OTA slot holds $OTA_SLOT: $(( HUB * 100 / OTA_SLOT ))% of it, $(( OTA_SLOT - HUB )) bytes free |"
+            echo "| Node app | $NODE | bundled into the hub |"
             echo "| Node app, Arduino Nano ESP32 test node | $NANO | flashed over USB |"
+            if [ -n "${HUB_FLAGS:-}" ]; then echo; echo "**Hub built with ${HUB_FLAGS}:** it didn't fit one update slot with its I2C sensors, so this build leaves them out (the capacitive probe, DHT11 and photoresistor still work)."; fi
           } >> "$GITHUB_STEP_SUMMARY"
           echo "HUB_BYTES=$HUB  NODE_BYTES=$NODE  NANO_NODE_BYTES=$NANO  HUB_PCT_OF_OTA_SLOT=$(( HUB * 100 / OTA_SLOT ))"
 

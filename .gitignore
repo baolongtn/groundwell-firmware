@@ -25,3 +25,5 @@ Thumbs.db
 
 # Generated: the node firmware bundled into the hub (tools/make_node_fw_h.py)
 hub/GroundwellHub/node_fw.h
+# Generated: the hub's pages, gzipped (tools/make_pages_gz.py)
+hub/GroundwellHub/pages_gz.h

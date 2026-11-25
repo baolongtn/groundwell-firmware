@@ -45,3 +45,8 @@ def main():
     print(f"node firmware {ver}: {len(binb)} bytes, init packet {len(dat)} bytes, CRC ok -> {out}")
 
 main()
+
+# The hub's pages, gzipped (v0.12): the IDE route needs them too, to fit the update slot with the node firmware inside.
+import importlib.util
+_spec = importlib.util.spec_from_file_location("make_pages_gz", os.path.join(os.path.dirname(os.path.abspath(__file__)), "make_pages_gz.py"))
+_mod = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_mod); _mod.main()
