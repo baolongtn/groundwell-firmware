@@ -16,11 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Host tests (link key HMAC, node update protocol)
+      - name: Host tests (link key HMAC, node update protocol, hub web update check)
         run: |
           cmp node/GroundwellNode/gw_hmac.h hub/GroundwellHub/gw_hmac.h || { echo "gw_hmac.h differs between node and hub"; exit 1; }
           g++ -O2 -Wall -Wextra -o /tmp/hmac_test tools/hmac_test.cpp && /tmp/hmac_test
           g++ -O2 -Wall -Wextra -o /tmp/node_dfu_test tools/node_dfu_test.cpp && /tmp/node_dfu_test
+          g++ -O2 -Wall -Wextra -o /tmp/ota_check_test tools/ota_check_test.cpp && /tmp/ota_check_test
 
       - uses: arduino/setup-arduino-cli@v2
 
@@ -52,6 +53,18 @@ jobs:
           curl -sSL -o uf2families.json https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2families.json
           python3 uf2conv.py -c -f 0xADA52840 -o build/node/GroundwellNode.uf2 build/node/GroundwellNode.ino.hex
 
+      - name: Build node test variant (Arduino Nano ESP32)
+        run: |
+          # Same sketch, bench test node: broadcast only, flashed over USB (the hub doesn't update it).
+          arduino-cli compile --warnings default --fqbn esp32:esp32:nano_nora \
+            --output-dir build/node-nano-esp32 node/GroundwellNode 2>&1 | tee build/node-nano-esp32.log
+          test -f build/node-nano-esp32/GroundwellNode.ino.bin
+          # Named files for the artifact, so the Nano's don't get mixed up with the XIAO's.
+          cp build/node-nano-esp32/GroundwellNode.ino.bin build/node-nano-esp32/GroundwellNode-nano-esp32.bin
+          if [ -f build/node-nano-esp32/GroundwellNode.ino.merged.bin ]; then
+            cp build/node-nano-esp32/GroundwellNode.ino.merged.bin build/node-nano-esp32/GroundwellNode-nano-esp32.merged.bin
+          fi
+
       - name: Bundle the node firmware into the hub
         run: python3 tools/make_node_fw_h.py build/node/GroundwellNode.ino.zip
 
@@ -72,26 +85,23 @@ jobs:
             --output-dir build/hub-crashtest hub/GroundwellHub > build/hub-crashtest.log 2>&1 || { cat build/hub-crashtest.log; exit 1; }
           mv build/hub-crashtest/GroundwellHub.ino.bin build/hub-crashtest/GroundwellHub-crashtest.bin
 
-      - name: Check hub files against the hub's own upload checks
+      - name: Check hub files against the hub's own upload check
         run: |
-          python3 - <<'PY'
-          def accepted(path):   # same test as handleUpdateUpload(): image magic, app descriptor, ESP32-C6 chip id
-              b = open(path, 'rb').read(48)
-              return b[0] == 0xE9 and b[32:36] == bytes([0x32, 0x54, 0xCD, 0xAB]) and (b[12] | b[13] << 8) == 0x000D
-          cases = [("build/hub/GroundwellHub.ino.bin", True),
-                   ("build/hub-crashtest/GroundwellHub-crashtest.bin", True),
-                   ("build/hub/GroundwellHub.ino.merged.bin", False),
-                   ("build/node/GroundwellNode.ino.hex", False)]
-          for path, want in cases:
-              got = accepted(path)
-              print(f"{path}: {'accepted' if got else 'refused'} ({'as expected' if got == want else 'UNEXPECTED'})")
-              assert got == want
-          PY
+          # The real check (hub/GroundwellHub/ota_check.h), fed each file in the browser's 1436-byte pieces through
+          # a fake Update library that, like the real one, only advances progress() per 4 KB sector.
+          /tmp/ota_check_test \
+            build/hub/GroundwellHub.ino.bin=accept \
+            build/hub-crashtest/GroundwellHub-crashtest.bin=accept \
+            build/hub/GroundwellHub.ino.merged.bin=refuse \
+            build/node/GroundwellNode.ino.hex=refuse \
+            build/node/GroundwellNode.ino.zip=refuse \
+            build/node-nano-esp32/GroundwellNode-nano-esp32.bin=refuse
 
       - name: Size report
         run: |
           HUB=$(grep -oP 'Sketch uses \K[0-9]+' build/hub.log)
           NODE=$(grep -oP 'Sketch uses \K[0-9]+' build/node.log || echo "?")
+          NANO=$(grep -oP 'Sketch uses \K[0-9]+' build/node-nano-esp32.log || echo "?")
           OTA_SLOT=1966080   # one app slot in partitions.csv
           {
             echo "## Firmware size"
@@ -99,8 +109,9 @@ jobs:
             echo "|---|---|---|"
             echo "| Hub app (with the node firmware inside) | $HUB | OTA slot holds $OTA_SLOT: $(( HUB * 100 / OTA_SLOT ))% of it |"
             echo "| Node app | $NODE | |"
+            echo "| Node app, Arduino Nano ESP32 test node | $NANO | flashed over USB |"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "HUB_BYTES=$HUB  NODE_BYTES=$NODE  HUB_PCT_OF_OTA_SLOT=$(( HUB * 100 / OTA_SLOT ))"
+          echo "HUB_BYTES=$HUB  NODE_BYTES=$NODE  NANO_NODE_BYTES=$NANO  HUB_PCT_OF_OTA_SLOT=$(( HUB * 100 / OTA_SLOT ))"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -112,4 +123,6 @@ jobs:
             build/node/GroundwellNode.ino.hex
             build/node/GroundwellNode.ino.zip
             build/node/GroundwellNode.uf2
+            build/node-nano-esp32/GroundwellNode-nano-esp32.bin
+            build/node-nano-esp32/GroundwellNode-nano-esp32.merged.bin
           if-no-files-found: warn
