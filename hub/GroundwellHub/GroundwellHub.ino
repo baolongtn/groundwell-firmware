@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL hub v0.12.0
+  GROUNDWELL hub v0.12.1
   Board: Seeed XIAO ESP32-C6, Arduino core "esp32 by Espressif Systems" 3.x (NOT 4.x: it replaced the BLE API),
          board "XIAO_ESP32C6", Tools > Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)".
          The menu only sets the IDE's size check: partitions.csv in this folder replaces the layout with two
@@ -38,6 +38,16 @@
       been reset is spotted by its continuous advertising in its link window.
     - Rod probes are gone (node firmware 0.12). A probe a node stops sending is dropped from the cards and the
       upload at once, so the rod card of an updated node goes away by itself. v0.11 nodes still work.
+  v0.12.1: crash fixes and crash reports
+    - The Bluetooth library keeps a copy of every device it hears, with no limit, until the list is cleared, and
+      the hub only cleared it at each cloud upload (never while Wi-Fi was down or uploads were off). In a busy
+      room the list grew until an allocation on the Bluetooth task failed and the hub restarted (abort() on
+      nimble_host). It is now cleared every 10 s, whatever else is going on.
+    - More free memory: 180 live points per probe instead of 720 (the dashboard plots the last hour, about 120),
+      and the sensor task only exists when sensors are wired to the hub (6 KB stack).
+    - Crash reports: at start the hub reads the crash dump the ESP32 keeps in flash and records the reason, task,
+      program counter and the code addresses on that task's stack: in the event log, on /diag, and in the
+      /update note when a trial firmware is rolled back. Decode them against that build's .elf.
   Setup page (v0.9.1)
     - Wi-Fi, cloud URL, ingest key and the update password live in the hub's own memory, set on /setup.
     - No Wi-Fi saved, or none found within 3 minutes of power-up, or the BOOT button held for 3 s:
@@ -84,6 +94,8 @@
 #include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
+#include <esp_core_dump.h>
+#include <esp_app_desc.h>
 #include <time.h>
 #include "bthome.h"
 #if __has_include("pages_gz.h")
@@ -120,9 +132,9 @@
   #define GW_CRASH_TEST 0      // 1 = rollback test build: crashes 20 s after every boot (the GitHub build makes one)
 #endif
 #if GW_CRASH_TEST
-  #define GW_FW_VERSION "0.12.0-crashtest"
+  #define GW_FW_VERSION "0.12.1-crashtest"
 #else
-  #define GW_FW_VERSION "0.12.0"
+  #define GW_FW_VERSION "0.12.1"
 #endif
 static const char *FW_VERSION = GW_FW_VERSION;
 // Optional secrets.h (git-ignored): WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY and optionally OTA_PASS.
@@ -173,10 +185,12 @@ static const uint32_t SETUP_OPEN_MS    = 15UL * 60 * 1000;   // hotspot opened w
 static const uint32_t TRIAL_MIN_MS     = 10UL * 60 * 1000;   // a new firmware must run this long (plus the checks) to be kept
 static const uint8_t  TRIAL_CRASHES    = 3;                  // crashes on trial before going back to the previous firmware
 static const uint32_t WATCHDOG_MS      = 60000;              // the main loop must come round within this, or the hub resets
+static const uint32_t SCAN_CLEAR_MS    = 10000;              // empty the Bluetooth library's list of devices heard this often (v0.12.1)
 static const int      SETUP_BTN_PIN    = BOOT_PIN;           // the BOOT button (GPIO 9 on the ESP32-C6)
 // ========================================================
 
-static const int MAX_NODES = 8, MAX_SENSORS = 16, LIVE_LEN = 720, DAY_LEN = 288, QUEUE_LEN = 3000, CLIM_LEN = 600, LIGHT_LEN = 600;
+// LIVE_LEN: the dashboard plots the last hour, about 120 points at one reading per 30 s; 180 leaves room (v0.12.1, was 720).
+static const int MAX_NODES = 8, MAX_SENSORS = 16, LIVE_LEN = 180, DAY_LEN = 288, QUEUE_LEN = 3000, CLIM_LEN = 600, LIGHT_LEN = 600;
 static const int H_SLOTS = 12, DT_LEN = 16;               // health window: 12 x 5 min = the last hour; last 16 reading gaps
 static const uint32_t H_SLOT_MS = 5UL * 60 * 1000;
 static const char *KIND[] = {"Capacitive", "Rod", "Probe 3", "Probe 4"};
@@ -308,6 +322,9 @@ uint32_t uploadsOk = 0, uploadsFail = 0, lastUploadAt = 0, lastUploadMs = 0, wif
 char lastUploadErr[100] = "";
 bool lastUploadGood = false;
 uint16_t uploadFailStreak = 0;               // failed uploads in a row (v0.12)
+uint32_t scanClears = 0;                     // times the Bluetooth device list was emptied (v0.12.1)
+String crashText;                            // the crash dump in flash, summarised (v0.12.1); "" = none
+bool crashIsMine = false;                    // that dump came from this firmware build
 uint8_t hSlot = 0, hSlots = 1;               // health window: current slot, and how many slots hold data so far
 uint32_t hSlotAt = 0;
 char localMac[18] = "";                      // the hub's own sensors appear as a node with this address
@@ -596,8 +613,7 @@ static void uploadBatch() {
   nl = lCount < 100 ? lCount : 100;
   if (n == 0 && nc == 0 && nl == 0) {
     xSemaphoreGive(lock);
-    scan->stop(); scan->clearResults(); scan->start(0, nullptr, false);   // keep the result list short
-    return;
+    return;                                           // the device list is emptied every 10 s in loop()
   }
   int nSens = 0;
   for (int i = 0; i < MAX_SENSORS; i++) if (sensors[i].used) nSens++;
@@ -652,8 +668,8 @@ static void uploadBatch() {
   // upload runs so Wi-Fi gets the radio and the handshake gets the memory it needs.
   // Nodes repeat each packet for 5 s, so a 1 to 3 s pause loses nothing.
   scan->stop();
+  delay(20);                                          // let a Bluetooth event already in progress finish first
   scan->clearResults();
-  delay(20);
 
   int code = -1;
   char tlsErr[100] = "";
@@ -979,6 +995,46 @@ static void closeSetup() {
 
 static bool fromHotspot() { return apOn && server.client().localIP() == WiFi.softAPIP(); }
 
+// ---------------- crash reports (v0.12.1) ----------------
+// The ESP32 writes a crash dump to the "coredump" partition on every crash (core setting). At start, summarise
+// it in one line: reason, task, program counter, return address and the code addresses on that task's stack,
+// newest first. Decode them with the .elf of the build that crashed (riscv32-esp-elf-addr2line -pfiaC -e ...).
+// A new dump is logged once; the summary stays on /diag (and goes into the rollback note) until the next crash.
+static void readCrashDump() {
+  if (esp_core_dump_image_check() != ESP_OK) return;          // no dump in flash
+  esp_core_dump_summary_t *sum = (esp_core_dump_summary_t *)calloc(1, sizeof(esp_core_dump_summary_t));
+  if (!sum) return;
+  if (esp_core_dump_get_summary(sum) == ESP_OK) {
+    char reason[96] = "";
+    if (esp_core_dump_get_panic_reason(reason, sizeof reason) != ESP_OK) reason[0] = 0;
+    char task[17], sha[10], mine[10];
+    memcpy(task, sum->exc_task, 16); task[16] = 0;
+    memcpy(sha, sum->app_elf_sha256, 9); sha[9] = 0;
+    esp_app_get_elf_sha256(mine, sizeof mine);
+    crashIsMine = !strncmp(sha, mine, 9);
+    char b[420];
+    int k = snprintf(b, sizeof b, "%s; task %s, pc %08lx, ra %08lx, mcause %lx, mtval %lx; build %s; stack", reason[0] ? reason : "crash",
+                     task, (unsigned long)sum->exc_pc, (unsigned long)sum->ex_info.ra, (unsigned long)sum->ex_info.mcause,
+                     (unsigned long)sum->ex_info.mtval, sha);
+    int found = 0;
+    for (uint32_t off = 0; off + 4 <= sum->exc_bt_info.dump_size && found < 16 && k < (int)sizeof b - 10; off += 4) {
+      uint32_t v;
+      memcpy(&v, sum->exc_bt_info.stackdump + off, 4);
+      if ((v >= 0x42000000 && v < 0x42800000) || (v >= 0x40800000 && v < 0x40880000)) {   // flash or RAM code
+        k += snprintf(b + k, sizeof b - k, " %08lx", (unsigned long)v);
+        found++;
+      }
+    }
+    crashText = b;
+    String id = String(sha) + String(sum->exc_pc, HEX) + String(sum->ex_info.ra, HEX);
+    if (otaPrefs.getString("crashid", "") != id) {           // a new crash
+      otaPrefs.putString("crashid", id);
+      logEvent("Crash on record (%s): %s", crashIsMine ? "this firmware" : "another build", b);
+    }
+  }
+  free(sum);
+}
+
 // ---------------- firmware trial and rollback ----------------
 // A new firmware runs on trial. Each crash (panic or watchdog) on trial counts; after TRIAL_CRASHES the hub
 // switches back to the other slot, which still holds the previous firmware. Power cuts, brownouts and the
@@ -992,8 +1048,7 @@ static void trialStart() {   // called after a new firmware is written, just bef
   otaPrefs.putString("prevVer", FW_VERSION);
 }
 
-static void trialCheckAtBoot() {
-  otaPrefs.begin("gwota", false);
+static void trialCheckAtBoot() {   // otaPrefs is open (setup)
   if (!otaPrefs.getBool("trial", false)) return;
   if (otaPrefs.getString("prev", "") == slotName()) {   // the new firmware never started; the old one is still running
     otaPrefs.putBool("trial", false);
@@ -1009,12 +1064,14 @@ static void trialCheckAtBoot() {
     String back = otaPrefs.getString("prevVer", "the previous firmware");
     otaPrefs.putBool("trial", false);
     if (Update.rollBack()) {
-      otaPrefs.putString("note", String("Firmware ") + FW_VERSION + " crashed " + crashes + " times on trial, so the hub went back to " + back + ".");
+      otaPrefs.putString("note", String("Firmware ") + FW_VERSION + " crashed " + crashes + " times on trial, so the hub went back to " + back + "." +
+                                 (crashIsMine && crashText.length() ? String(" Last crash: ") + crashText : String("")));
       logEvent("Going back to firmware %s", back.c_str());
       delay(200);
       ESP.restart();
     }
-    otaPrefs.putString("note", String("Firmware ") + FW_VERSION + " crashed on trial, and the previous firmware couldn't be restored.");
+    otaPrefs.putString("note", String("Firmware ") + FW_VERSION + " crashed on trial, and the previous firmware couldn't be restored." +
+                               (crashIsMine && crashText.length() ? String(" Last crash: ") + crashText : String("")));
     return;
   }
   trialActive = true;
@@ -1606,6 +1663,8 @@ static void handleDiagApi() {
   jsonKV(j, "nodeFw", NODE_FW_VERSION);
   jsonKV(j, "nodeFwLen", (long)NODE_FW_LEN);
   jsonKV(j, "note", otaPrefs.getString("note", "").c_str());
+  jsonKV(j, "crash", crashText.c_str());           // v0.12.1: the crash dump in flash, summarised
+  jsonKB(j, "crashMine", crashIsMine);
   j += "\"sens\":{";                                // sensors wired to the hub (v0.12)
   jsonKB(j, "on", lsMask & LS_ON);
   jsonKB(j, "dht", lsMask & LS_DHT); jsonKB(j, "ldr", lsMask & LS_LDR); jsonKB(j, "i2c", lsMask & LS_I2C);
@@ -1650,6 +1709,7 @@ static void handleDiagApi() {
   jsonKV(j, "fresh", (long)freshTotal);
   jsonKV(j, "intervalMs", 100L);                   // scan->setInterval(160) x 0.625 ms
   jsonKV(j, "windowMs", 50L);
+  jsonKV(j, "clears", (long)scanClears);
   jsonKB(j, "job", jobBusy);
   jsonKV(j, "jobNode", jobBusy && jobNode >= 0 ? nodes[jobNode].mac : "");
   jsonKV(j, "jobS", jobBusy ? ageS(now, jobStartedAt) : -1L);
@@ -1875,7 +1935,9 @@ static void localStart() {
              airSrc, lightName(), ltrOk ? ", UV ltr390" : "", calOk ? "yes" : "no (run tools/factory_cal.py)");
     if ((mask & LS_I2C) && !shtOk && !ahtOk && !ltrOk) logEvent("Sensors wired to this hub: no I2C sensor answered on %s", I2C_PINS);
   }
-  xTaskCreate(localTask, "gwlocal", 8192, nullptr, 1, nullptr);   // also answers serial commands when the sensors are off
+  // Only when sensors are wired: a hub without them keeps the memory (loop() answers serial commands instead).
+  if ((mask & LS_ON) && xTaskCreate(localTask, "gwlocal", 6144, nullptr, 1, nullptr) != pdPASS)
+    logEvent("Sensors wired to this hub: couldn't start their task (out of memory)");
 }
 
 // ---------------- setup / loop ----------------
@@ -1886,6 +1948,8 @@ void setup() {
   logEvent("Hub %s started from slot %s (last reset: %s)", FW_VERSION, slotName(), espResetText(esp_reset_reason()));
   lock = xSemaphoreCreateMutex();
   prefs.begin("groundwell", false);
+  otaPrefs.begin("gwota", false);
+  readCrashDump();                                 // summarise the last crash, if any (v0.12.1)
   trialCheckAtBoot();                              // may switch back to the previous firmware and restart
   loadConfig();
   pinMode(SETUP_BTN_PIN, INPUT_PULLUP);
@@ -2034,6 +2098,18 @@ void loop() {
   }
 
   // The scan result list is cleared during each upload pause (every 30 s), while the scan is stopped.
+  // Bluetooth device list (v0.12.1): the library stores every device it hears, with no limit, until cleared.
+  // Clear it every 10 s (only safe while the scan is stopped), so a busy room can't use up the memory.
+  static uint32_t lastScanClear = 0;
+  if (now - lastScanClear >= SCAN_CLEAR_MS && !jobBusy && !otaBusy) {
+    lastScanClear = now;
+    scan->stop();
+    delay(5);                                      // a Bluetooth event already in progress finishes first
+    scan->clearResults();
+    scan->start(0, nullptr, false);
+    scanClears++;
+  }
+  if (!(lsMask & LS_ON) && Serial.available()) serviceLocalSerial();   // no sensor task: still answer serial commands
   if (now - lastDayPush >= DAY_BUCKET_MS) pushDay();
   if (now - hSlotAt >= H_SLOT_MS) rotateHealthSlot();
   if (now - lastUpload >= UPLOAD_MS) { lastUpload = now; uploadBatch(); }
