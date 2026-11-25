@@ -1,6 +1,6 @@
 // Host-side test of the node's photoresistor conversion (LIGHT_LDR).
 // Run from the tools folder:
-//   python3 -c "s=open('../node/GroundwellNode/GroundwellNode.ino').read(); a=s.index('// Photoresistor model'); b=s.index('static const uint16_t LDR_SETTLE_MS'); c=s.index('__attribute__((unused)) static float ldrLux('); d=s.index('#if LIGHT_SENSOR == LIGHT_VEML7700', c); open('node_ldr.inc','w').write(s[a:b]+s[c:d])"
+//   python3 -c "s=open('../node/GroundwellNode/GroundwellNode.ino').read(); a=s.index('// Photoresistor model'); b=s.index('static const uint16_t LDR_SETTLE_MS'); c=s.index('__attribute__((unused)) static float ldrLux('); d=s.index('#if LIGHT_SENSOR == LIGHT_I2C', c); open('node_ldr.inc','w').write(s[a:b]+s[c:d])"
 //   g++ -std=c++17 -Wall -o ldrtest ldr_lux_test.cpp && ./ldrtest
 #include <cstdio>
 #include <cmath>

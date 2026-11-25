@@ -93,6 +93,26 @@
     The current through the soil is reversed on every reading and both phases
     last the same time, so there is no net DC: the rods don't electroplate or
     corrode, and soil polarization cancels out.
+
+  Test node on an Arduino Nano ESP32 (bench use, until more XIAOs arrive)
+    The same sketch also builds for the Arduino Nano ESP32: board package "esp32" 3.x (the one the hub
+    uses), board "Arduino Nano ESP32", Pin Numbering "By Arduino pin (default)". It sends the same BTHome
+    packet, so the hub shows it like any other node, and it takes the same serial commands, so
+    tools/factory_cal.py calibrates it the same way. What's different:
+      - Its adverts are non-connectable. The hub reads them but never connects, so it never links or
+        updates this node over Bluetooth: flash it over USB.
+      - It runs on USB only and never sleeps (tens of mA), so it says nothing about battery life.
+        It reports a fixed 3.30 V supply, because the ESP32 can't measure its own rail.
+      - Its ADC isn't referenced to the supply like the nRF52840's. The sketch reads calibrated
+        millivolts and scales them to the 3.3 V rail, so the same 0..4095 math holds, but the input
+        tops out near 3.1 V: the photoresistor saturates around 70,000 lux and very wet rods read a
+        little low. Run factory calibration on it; the capacitive probe then reads on the same scale.
+    Nano ESP32 wiring (every analog input on ADC1, A0..A3; D and A pins are separate pins on the Nano)
+      Capacitive   black GND -> GND, red VCC -> D2, yellow AOUT -> A0
+      Rods         wire 1 -> D3, wire 2 -> A2, 10 kOhm between A2 and D4
+      DHT11        DATA -> D6, VCC -> 3V3 (never 5V: the Nano's pins are 3.3 V only), GND -> GND
+      GL5539       leg 1 -> D7, leg 2 -> A3, 1 kOhm between A3 and GND
+      I2C sensors  (LIGHT_I2C) SDA -> A4, SCL -> A5; the rod reference stays on D4
 */
 
 static const char *FW_VERSION = "0.10.0";
@@ -103,12 +123,32 @@ static const char *FW_VERSION = "0.10.0";
 #define LIGHT_VEML7700 LIGHT_I2C                 // older name for the same wiring
 #define LIGHT_SENSOR   LIGHT_LDR                 // <-- change to LIGHT_I2C when you fit I2C sensors
 
+// ---------------- board ----------------
+#if defined(ARDUINO_ARCH_NRF52)
+#define GW_NRF52 1                               // Seeed XIAO nRF52840: the product node
+#define GW_ESP32 0
+#elif defined(ARDUINO_ARCH_ESP32)
+#define GW_NRF52 0
+#define GW_ESP32 1                               // Arduino Nano ESP32: bench test node (see the header)
+#if !defined(ARDUINO_NANO_ESP32)
+#warning "ESP32 build: the pins below are for the Arduino Nano ESP32; check them against your board"
+#endif
+#else
+#error "GroundwellNode builds for the Seeed XIAO nRF52840, or as a test node for the Arduino Nano ESP32"
+#endif
+
+#if GW_NRF52
 #include <bluefruit.h>
 #include "gw_hmac.h"
-#include <DHT.h>
 #include <Adafruit_LittleFS.h>
 #include <InternalFileSystem.h>
 using namespace Adafruit_LittleFS_Namespace;
+#else
+#include <BLEDevice.h>
+#include <BLEAdvertising.h>
+#include <Preferences.h>
+#endif
+#include <DHT.h>
 #if LIGHT_SENSOR == LIGHT_I2C
 #include <Wire.h>
 #include <Adafruit_VEML7700.h>
@@ -127,7 +167,7 @@ static const float    AIR_CONFIRM_RH  = 6.0f;
 static const int8_t   TX_POWER_DBM    = 4;     // 0 or 4; raise to 8 if the hub is far away
 static const uint32_t DFU_WINDOW_MS   = 10UL * 60 * 1000;   // Bluetooth updates accepted this long after a reset (0 = never)
 static const uint16_t CAP_SETTLE_MS   = 150;   // capacitive probe power-up settle
-static const uint8_t  OVERSAMPLE      = 16;
+static const uint8_t  OVERSAMPLE      = GW_ESP32 ? 64 : 16;   // the ESP32's ADC is noisier: average more
 #define DHT_TYPE DHT11                           // DHT22 if you upgrade the sensor
 
 // Photoresistor model (LIGHT_LDR only). lux = 10 * (LDR_R10_OHMS / R) ^ (1 / LDR_GAMMA)
@@ -150,6 +190,7 @@ static const uint16_t CAL_GAP_MS    = 500;   // ... 0.5 s apart = 10 s
 static const char    *CAL_FILE      = "/gwcal.bin";
 
 // ---------------- pins ----------------
+#if GW_NRF52
 static const int PIN_CAP_AOUT  = A0;   // D0
 static const int PIN_CAP_POWER = D1;
 static const int PIN_ROD_SENSE = A2;   // D2
@@ -161,6 +202,25 @@ static const int PIN_ROD_REF   = D7;   // through the 10k to D2 (D4/D5 are the I
 static const int PIN_ROD_REF   = D4;   // through the 10k to D2
 static const int PIN_LDR_POWER = D7;
 static const int PIN_LDR_SENSE = A5;   // D5
+#endif
+__attribute__((unused)) static const char *I2C_PINS = "D4/D5";
+#define OUTPUT_STRONG OUTPUT_H0H1                // high drive: the capacitive probe pulls a few mA
+#else
+// Arduino Nano ESP32 (Arduino pin numbering). Every analog input is on ADC1 (A0..A3); A4/A5 are on ADC2
+// and are the I2C pins. D0/D1 are the Nano's UART, so the probe power moves to D2.
+static const int PIN_CAP_AOUT  = A0;
+static const int PIN_CAP_POWER = D2;
+static const int PIN_ROD_SENSE = A2;
+static const int PIN_ROD_A     = D3;
+static const int PIN_ROD_REF   = D4;   // through the 10k to A2, with either wiring (I2C is on A4/A5)
+static const int PIN_DHT       = D6;
+#if LIGHT_SENSOR != LIGHT_I2C
+static const int PIN_LDR_POWER = D7;
+static const int PIN_LDR_SENSE = A3;
+#endif
+__attribute__((unused)) static const char *I2C_PINS = "A4/A5";
+#define OUTPUT_STRONG OUTPUT                     // ESP32 GPIOs drive about 20 mA by default
+static const uint16_t ESP_VDD_MV = 3300;         // the Nano's 3.3 V rail: ADC scale and the reported supply
 #endif
 
 DHT dht(PIN_DHT, DHT_TYPE);
@@ -180,13 +240,16 @@ static bool calOk = false;
 static uint16_t pendAir = 0, pendWater = 0;           // this session's CAL AIR / CAL WATER results
 static uint32_t lastSentAt = 0;                       // for the dt= cadence check in the serial log
 
-// Hub link (v0.10): the key the hub proved or set, kept in flash like the calibration
+// Hub link (v0.10): the key the hub proved or set, kept in flash like the calibration (XIAO only)
+#if GW_NRF52
 static const char *KEY_FILE = "/gwkey.bin";
 static const uint32_t KEY_MAGIC = 0x4B455931;        // "KEY1"
 struct KeyData { uint32_t magic; uint8_t key[16]; uint32_t check; };
 static uint8_t linkKey[16];
-static volatile bool keyOk = false, keyDirty = false, authed = false;
+static volatile bool keyDirty = false, authed = false;
 static uint8_t nonce[16];
+#endif
+static volatile bool keyOk = false;                  // stays false on the ESP32 test node: it never links
 static float lastVdd = 0;
 static SemaphoreHandle_t wakeSem;                    // lets a Bluetooth event wake the main loop early
 static uint32_t fastUntil = 0;                        // FAST command: 5 s readings until this millis()
@@ -194,10 +257,22 @@ static uint32_t fastUntil = 0;                        // FAST command: 5 s readi
 struct AirFilter { bool have, pend; float t, h, pt, ph; };
 
 // ---------------- measurements ----------------
+// One ADC sample as 0..4095 of the supply rail, the scale every reading below is written for.
+static uint16_t adcRead(int pin) {
+#if GW_NRF52
+  return (uint16_t)analogRead(pin);                  // AR_VDD4: already ratiometric to VDD
+#else
+  // The ESP32's ADC has its own reference, so read calibrated millivolts and scale them to the 3.3 V rail.
+  // The input range ends near 3.1 V, so readings close to the rail saturate a little below 4095.
+  uint32_t c = ((uint32_t)analogReadMilliVolts(pin) * 4095u + ESP_VDD_MV / 2) / ESP_VDD_MV;
+  return (uint16_t)(c > 4095u ? 4095u : c);
+#endif
+}
+
 static uint16_t avgRead(int pin, uint8_t n) {
-  analogRead(pin);                                   // discard the first sample after switching
+  adcRead(pin);                                      // discard the first sample after switching
   uint32_t acc = 0;
-  for (uint8_t i = 0; i < n; i++) acc += analogRead(pin);
+  for (uint8_t i = 0; i < n; i++) acc += adcRead(pin);
   return (uint16_t)(acc / n);
 }
 
@@ -234,7 +309,11 @@ static uint16_t readRods() {
 }
 
 // Supply voltage through the SAADC's internal VDD channel (no divider, no leakage).
+// The ESP32 test node can't measure its own rail, so it reports the nominal 3.30 V (it runs on USB).
 static float readVDD() {
+#if GW_ESP32
+  return ESP_VDD_MV / 1000.0f;
+#else
   volatile int16_t result = 0;
   NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_12bit;
   NRF_SAADC->ENABLE = SAADC_ENABLE_ENABLE_Enabled;
@@ -264,6 +343,7 @@ static float readVDD() {
   NRF_SAADC->ENABLE = SAADC_ENABLE_ENABLE_Disabled;
   if (result < 0) result = 0;
   return result * 3.6f / 4096.0f;                    // gain 1/6, 0.6 V reference
+#endif
 }
 
 // DHT11: 1 s minimum between reads (we read every 5 s). A failed read returns false and
@@ -500,27 +580,51 @@ static bool readLight(float &lux) {
 }
 #endif
 
+// ---------------- flash storage ----------------
+// XIAO: files in the nRF52's internal LittleFS. Nano ESP32: NVS (Preferences), because the Nano's default
+// partition table has no LittleFS partition. Same records, same checks, either way.
+#if GW_NRF52
+static void storeBegin() { InternalFS.begin(); }
+static bool storeRead(const char *path, void *buf, size_t n) {
+  File f(InternalFS);
+  if (!f.open(path, FILE_O_READ)) return false;
+  bool ok = f.read(buf, n) == (int)n;
+  f.close();
+  return ok;
+}
+static bool storeWrite(const char *path, const void *buf, size_t n) {
+  InternalFS.remove(path);                           // FILE_O_WRITE appends, so start fresh
+  File f(InternalFS);
+  if (!f.open(path, FILE_O_WRITE)) return false;
+  bool ok = f.write((const uint8_t *)buf, n) == n;
+  f.close();
+  return ok;
+}
+static void storeRemove(const char *path) { InternalFS.remove(path); }
+#else
+static Preferences prefs;
+static const char *prefKey(const char *path) { return path[0] == '/' ? path + 1 : path; }   // NVS keys: 15 chars max
+static void storeBegin() { prefs.begin("groundwell", false); }
+static bool storeRead(const char *path, void *buf, size_t n) {
+  return prefs.isKey(prefKey(path)) && prefs.getBytes(prefKey(path), buf, n) == n;
+}
+static bool storeWrite(const char *path, const void *buf, size_t n) { return prefs.putBytes(prefKey(path), buf, n) == n; }
+static void storeRemove(const char *path) { if (prefs.isKey(prefKey(path))) prefs.remove(prefKey(path)); }
+#endif
+
 // ---------------- factory calibration ----------------
 static uint16_t calCheck(const CalData &c) { return (uint16_t)(c.air ^ c.water ^ c.version ^ 0xA5A5u); }
 
 static void loadCal() {
   calOk = false;
-  File f(InternalFS);
-  if (!f.open(CAL_FILE, FILE_O_READ)) return;
   CalData c;
-  bool ok = f.read(&c, sizeof c) == (int)sizeof c;
-  f.close();
-  if (ok && c.magic == CAL_MAGIC && c.check == calCheck(c) && c.air > c.water) { cal = c; calOk = true; }
+  if (storeRead(CAL_FILE, &c, sizeof c) && c.magic == CAL_MAGIC && c.check == calCheck(c) && c.air > c.water) { cal = c; calOk = true; }
 }
 
 static bool saveCal(uint16_t air, uint16_t water) {
   CalData c = {CAL_MAGIC, air, water, 1, 0};
   c.check = calCheck(c);
-  InternalFS.remove(CAL_FILE);                       // FILE_O_WRITE appends, so start fresh
-  File f(InternalFS);
-  if (!f.open(CAL_FILE, FILE_O_WRITE)) return false;
-  bool ok = f.write((const uint8_t *)&c, sizeof c) == sizeof c;
-  f.close();
+  bool ok = storeWrite(CAL_FILE, &c, sizeof c);
   loadCal();
   return ok && calOk && cal.air == air && cal.water == water;
 }
@@ -573,11 +677,21 @@ static const char *lightName() {
 #endif
 }
 
-static void printInfo() {
+// Bluetooth address as the hub shows it: "AA:BB:CC:DD:EE:FF".
+static void addrText(char *out) {
+#if GW_NRF52
   ble_gap_addr_t a = Bluefruit.getAddr();
-  Serial.printf("INFO fw=%s mac=%02X:%02X:%02X:%02X:%02X:%02X interval_ms=%lu light=%s ",
-                FW_VERSION, a.addr[5], a.addr[4], a.addr[3], a.addr[2], a.addr[1], a.addr[0],
-                (unsigned long)REPORT_MS, lightName());
+  snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X", a.addr[5], a.addr[4], a.addr[3], a.addr[2], a.addr[1], a.addr[0]);
+#else
+  strlcpy(out, BLEDevice::getAddress().toString().c_str(), 18);
+  for (char *c = out; *c; c++) *c = (char)toupper((unsigned char)*c);
+#endif
+}
+
+static void printInfo() {
+  char mac[18];
+  addrText(mac);
+  Serial.printf("INFO fw=%s mac=%s interval_ms=%lu light=%s ", FW_VERSION, mac, (unsigned long)REPORT_MS, lightName());
 #if LIGHT_SENSOR == LIGHT_I2C
   Serial.printf("air=%s uv=%s ", airSrc, ltrOk ? "ltr390" : "none");
 #else
@@ -595,8 +709,12 @@ static void handleCommand(char *line) {
   else if (!strcmp(line, "CAL AIR"))   { if (measurePoint("AIR", pendAir))     { if (pendWater) finishCal(pendAir, pendWater); } else pendAir = 0; }
   else if (!strcmp(line, "CAL WATER")) { if (measurePoint("WATER", pendWater)) { if (pendAir) finishCal(pendAir, pendWater); } else pendWater = 0; }
   else if (sscanf(line, "CAL SET %u %u", &a, &w) == 2) finishCal((uint16_t)a, (uint16_t)w);
-  else if (!strcmp(line, "CAL CLEAR")) { InternalFS.remove(CAL_FILE); calOk = false; pendAir = pendWater = 0; Serial.println("CAL CLEARED OK"); }
-  else if (!strcmp(line, "UNLINK"))    { InternalFS.remove(KEY_FILE); keyOk = false; updateInfo(); Serial.println("UNLINKED OK"); }
+  else if (!strcmp(line, "CAL CLEAR")) { storeRemove(CAL_FILE); calOk = false; pendAir = pendWater = 0; Serial.println("CAL CLEARED OK"); }
+#if GW_NRF52
+  else if (!strcmp(line, "UNLINK"))    { storeRemove(KEY_FILE); keyOk = false; updateInfo(); Serial.println("UNLINKED OK"); }
+#else
+  else if (!strcmp(line, "UNLINK"))    Serial.println("UNLINKED OK (this test node never links to a hub)");
+#endif
   else if (!strcmp(line, "FAST"))      { fastUntil = millis() + FAST_FOR_MS; Serial.printf("FAST interval_ms=%lu for_s=%lu OK\n", (unsigned long)FAST_REPORT_MS, (unsigned long)(FAST_FOR_MS / 1000)); }
   else if (line[0]) Serial.printf("ERR unknown command: %s\n", line);
 }
@@ -652,7 +770,9 @@ static uint8_t buildBTHome(uint8_t *b, uint8_t pid, bool airOk, float tempC, flo
   }
   return n;                                          // 26 bytes with air + light + UV (the legacy advert's limit), 14 with none
 }
+// ---- end BTHome packet (host-tested: tools/bthome_roundtrip_test.cpp) ----
 
+#if GW_NRF52
 BLEDis bledis;                                       // device information: shows the firmware version in nRF Connect
 
 static bool dfuWindowOpen() { return DFU_WINDOW_MS && millis() < DFU_WINDOW_MS; }
@@ -678,24 +798,15 @@ static uint32_t keyCheck(const KeyData &k) {
 
 static void loadKey() {
   keyOk = false;
-  File f(InternalFS);
-  if (!f.open(KEY_FILE, FILE_O_READ)) return;
   KeyData k;
-  bool ok = f.read(&k, sizeof k) == (int)sizeof k;
-  f.close();
-  if (ok && k.magic == KEY_MAGIC && k.check == keyCheck(k)) { memcpy(linkKey, k.key, 16); keyOk = true; }
+  if (storeRead(KEY_FILE, &k, sizeof k) && k.magic == KEY_MAGIC && k.check == keyCheck(k)) { memcpy(linkKey, k.key, 16); keyOk = true; }
 }
 
 static bool saveKey() {
   KeyData k = {KEY_MAGIC, {0}, 0};
   memcpy(k.key, linkKey, 16);
   k.check = keyCheck(k);
-  InternalFS.remove(KEY_FILE);
-  File f(InternalFS);
-  if (!f.open(KEY_FILE, FILE_O_WRITE)) return false;
-  bool ok = f.write((const uint8_t *)&k, sizeof k) == sizeof k;
-  f.close();
-  return ok;
+  return storeWrite(KEY_FILE, &k, sizeof k);
 }
 
 static void newNonce() {
@@ -866,6 +977,47 @@ static void advertise(const uint8_t *svc, uint8_t len) {
   Bluefruit.Advertising.start(continuous ? 0 : ADV_BURST_S);    // 0 = until the next reading replaces it
 }
 
+#else  // GW_ESP32: Arduino Nano ESP32 test node
+// Broadcast only. The adverts are non-connectable, so the hub reads the packet but never connects:
+// no link key, no Bluetooth updates (the hub only checks nodes whose adverts accept connections).
+static BLEAdvertising *adv = nullptr;
+static uint32_t burstEndsAt = 0;                     // millis() when the current burst stops (0 = radio quiet)
+
+static void bleBegin() {
+  BLEDevice::init("GW");
+  BLEDevice::setPower(ESP_PWR_LVL_P3);               // +3 dBm, the nearest ESP32 step to the XIAO's +4
+  adv = BLEDevice::getAdvertising();
+  adv->setScanResponse(false);
+#if defined(CONFIG_BLUEDROID_ENABLED)
+  adv->setAdvertisementType(ADV_TYPE_NONCONN_IND);
+#else
+  adv->setAdvertisementType(BLE_GAP_CONN_MODE_NON);  // NimBLE build of the core's BLE library
+#endif
+  adv->setMinInterval(ADV_INTERVAL_MS * 1000 / 625);
+  adv->setMaxInterval(ADV_INTERVAL_MS * 1000 / 625);
+}
+
+// Same advert as the XIAO's non-connectable burst: flags, then the BTHome service data.
+static void advertise(const uint8_t *svc, uint8_t len) {
+  uint8_t raw[31], n = 0;
+  raw[n++] = 2;       raw[n++] = 0x01; raw[n++] = 0x06;          // flags: LE general discoverable, no BR/EDR
+  raw[n++] = len + 1; raw[n++] = 0x16;                           // service data; svc starts with the 0xFCD2 UUID
+  memcpy(raw + n, svc, len);
+  n += len;
+  BLEAdvertisementData d;
+  d.addData((char *)raw, n);
+  adv->stop();
+  adv->setAdvertisementData(d);
+  adv->start();
+  burstEndsAt = (millis() + ADV_BURST_S * 1000UL) | 1;
+}
+
+// Called from the wait loop: ends the burst after ADV_BURST_S, like the XIAO's advertising timeout.
+static void serviceBurst() {
+  if (burstEndsAt && (int32_t)(millis() - burstEndsAt) >= 0) { adv->stop(); burstEndsAt = 0; }
+}
+#endif
+
 void setup() {
   Serial.begin(115200);
 
@@ -873,12 +1025,12 @@ void setup() {
   pinMode(LED_GREEN, OUTPUT); digitalWrite(LED_GREEN, HIGH);
   pinMode(LED_BLUE, OUTPUT);  digitalWrite(LED_BLUE, HIGH);
 
-  pinMode(PIN_CAP_POWER, OUTPUT_H0H1);               // high drive: the probe pulls a few mA
+  pinMode(PIN_CAP_POWER, OUTPUT_STRONG);             // the probe pulls a few mA
   digitalWrite(PIN_CAP_POWER, LOW);
   pinMode(PIN_ROD_A, INPUT);
   pinMode(PIN_ROD_REF, INPUT);
   dht.begin();
-  InternalFS.begin();
+  storeBegin();
   loadCal();
 #if LIGHT_SENSOR == LIGHT_I2C
   Wire.begin();
@@ -888,12 +1040,13 @@ void setup() {
   if (vemlOk) veml.enable(false);                    // shut down until the first reading
   ltrOk  = ltr390Begin();
   airSrc = shtOk ? "sht4x" : ahtOk ? "aht20" : "dht11";
-  Serial.printf("I2C sensors on D4/D5: air %s, light %s, UV %s\n", airSrc, lightName(), ltrOk ? "ltr390" : "none");
+  Serial.printf("I2C sensors on %s: air %s, light %s, UV %s\n", I2C_PINS, airSrc, lightName(), ltrOk ? "ltr390" : "none");
 #else
-  pinMode(PIN_LDR_POWER, OUTPUT_H0H1);
+  pinMode(PIN_LDR_POWER, OUTPUT_STRONG);
   digitalWrite(PIN_LDR_POWER, LOW);
 #endif
 
+#if GW_NRF52
   analogReference(AR_VDD4);                          // full scale = VDD -> ratiometric readings
   analogReadResolution(12);
 
@@ -908,12 +1061,22 @@ void setup() {
   bledis.setModel("Sensor node");
   bledis.setSoftwareRev(FW_VERSION);                 // firmware revision stays the bootloader's (update apps read it)
   bledis.begin();
+#else
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);                    // widest input range, about 0 to 3.1 V
+  wakeSem = xSemaphoreCreateBinary();
+  bleBegin();
+#endif
 
-  ble_gap_addr_t addr = Bluefruit.getAddr();
-  Serial.printf("GROUNDWELL node fw %s  address %02X:%02X:%02X:%02X:%02X:%02X\n", FW_VERSION,
-                addr.addr[5], addr.addr[4], addr.addr[3], addr.addr[2], addr.addr[1], addr.addr[0]);
+  char mac[18];
+  addrText(mac);
+  Serial.printf("GROUNDWELL node fw %s  address %s\n", FW_VERSION, mac);
+#if GW_NRF52
   Serial.printf("Hub link: %s\n", keyOk ? "linked" : "not linked yet (a hub links it within 10 minutes of a reset)");
   if (DFU_WINDOW_MS) Serial.printf("Bluetooth updates open for %lu min: nRF Connect > \"GW\" > DFU\n", (unsigned long)(DFU_WINDOW_MS / 60000));
+#else
+  Serial.println("Arduino Nano ESP32 test node: broadcast only. The hub reads it but won't link or update it; flash it over USB.");
+#endif
   if (calOk) Serial.printf("Factory calibration: air %u, water %u (sending moisture %%)\n", cal.air, cal.water);
   else       Serial.println("No factory calibration yet (sending the raw capacitive count). Send CAL AIR, then CAL WATER.");
 }
@@ -964,10 +1127,18 @@ void loop() {
   if ((int32_t)(millis() - nextAt) >= 0) nextAt = millis() + every;       // fell behind (a 10 s calibration, say)
   while ((int32_t)(nextAt - millis()) > 0) {
     serviceSerial();
+#if GW_NRF52
     serviceLink();
+#else
+    serviceBurst();
+#endif
     uint32_t left = nextAt - millis();
     if ((int32_t)left <= 0) break;
+#if GW_NRF52
     uint32_t wait = Serial ? (left > 50 ? 50 : left) : left;
+#else
+    uint32_t wait = left > 50 ? 50 : left;           // also ends the 6 s burst on time
+#endif
     xSemaphoreTake(wakeSem, pdMS_TO_TICKS(wait));    // the CPU sleeps here; a link-key write wakes it early
   }
 }
