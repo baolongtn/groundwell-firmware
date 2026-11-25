@@ -1,6 +1,6 @@
 // Host-side test: node packet builder -> hub decoder.
 // Run from the tools folder:
-//   python3 -c "s=open('../node/GroundwellNode/GroundwellNode.ino').read(); a=s.index('static uint8_t buildBTHome('); b=s.index('static void advertise('); open('node_build.inc','w').write(s[a:b])"
+//   python3 -c "s=open('../node/GroundwellNode/GroundwellNode.ino').read(); a=s.index('static uint8_t buildBTHome('); b=s.index('// ---- end BTHome packet'); open('node_build.inc','w').write(s[a:b])"
 //   g++ -std=c++17 -Wall -o roundtrip bthome_roundtrip_test.cpp && ./roundtrip
 #include <cstdio>
 #include <cmath>

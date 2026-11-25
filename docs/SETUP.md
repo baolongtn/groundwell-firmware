@@ -175,6 +175,42 @@ Each unit adds a row to `factory_cal_log.csv`: time, operator, MAC address, firm
 
 **The rod probe isn't factory calibrated.** It measures conductivity, which depends on dissolved salts as much as on water, so a factory point wouldn't carry over to a customer's soil. It is calibrated per pot on the hub, and the product should ship with the capacitive probe only.
 
+## 2c. Optional: a test node on an Arduino Nano ESP32
+
+Short on XIAOs? The same node sketch builds for an **Arduino Nano ESP32**. It sends the same Bluetooth packet, so the hub and cloud treat it as another node, and it takes the same serial commands, so section 2b calibrates it the same way. It is a bench node, not a product node.
+
+**Wiring.** On the Nano, D and A pins are separate pins (on the XIAO, D0 and A0 are one pin). Every pin is 3.3 V only: power the sensors from **3V3**, never 5V or VBUS.
+
+| Wire | XIAO nRF52840 | Nano ESP32 |
+|---|---|---|
+| Capacitive: black (GND) | GND | GND |
+| Capacitive: red (VCC) | D1 | **D2** |
+| Capacitive: yellow (AOUT) | D0 / A0 | **A0** |
+| Rod wire 1 | D3 | D3 |
+| Rod wire 2 | D2 / A2 | **A2** |
+| 10 kOhm resistor | D2 / A2 to D4 | **A2** to D4 |
+| DHT11 DATA / + / - | D6 / 3V3 / GND | D6 / 3V3 / GND |
+| Photoresistor leg 1 | D7 | D7 |
+| Photoresistor leg 2 | D5 / A5 | **A3** |
+| 1 kOhm resistor | D5 / A5 to GND | **A3** to GND |
+| I2C sensors (`LIGHT_I2C`) | SDA D4, SCL D5 | SDA **A4**, SCL **A5** (rod reference stays on D4) |
+
+All the analog inputs sit on A0 to A3, the ESP32-S3's ADC1. D0/D1 are the Nano's serial pins, which is why the probe power moves to D2.
+
+**Flash it.**
+1. Board package: **"esp32" 3.x** by Espressif, the one the hub already uses (not 4.0).
+2. Tools > Board > esp32 > **Arduino Nano ESP32**. Leave Tools > Pin Numbering on **By Arduino pin (default)**.
+3. Libraries: the same "DHT sensor library". The Bluetooth library comes with the esp32 package.
+4. Upload `node/GroundwellNode`. The banner says `Arduino Nano ESP32 test node: broadcast only`, and the reading lines look like the XIAO's.
+5. Run factory calibration (section 2b). `factory_cal.py` finds a Nano ESP32 by itself, like a XIAO. Calibrate even if you only want raw numbers: its ADC reads differently from the XIAO's, and calibration puts its capacitive probe on the same 0 to 100 scale.
+
+Every push also builds it on GitHub: Actions > latest run > Artifacts > `node-nano-esp32/GroundwellNode.ino.bin`.
+
+**How it differs from a XIAO node.**
+- **Broadcast only.** Its adverts don't accept connections, so the hub reads them but never links or updates this node. Update it over USB. The hub's node list shows its firmware as unchecked, which is expected.
+- **Power.** It runs on USB and never sleeps (tens of mA, against microamps for the XIAO), so it tells you nothing about battery life. It reports a fixed 3.30 V, because the ESP32 can't measure its own supply, so its battery level always reads full.
+- **ADC.** The ESP32's ADC isn't referenced to the supply. The sketch reads calibrated millivolts and scales them to the 3.3 V rail, so the same math applies, but inputs top out near 3.1 V: the photoresistor saturates around 70,000 lux (direct sun), and very wet rods read a little low. Lux is an estimate on either board.
+
 ## 3. Set up the cloud (free Cloudflare account, about 10 minutes)
 
 **Windows shortcut:** `setup-cloud.ps1` in the top folder runs every step below and fills `CLOUD_URL`, `INGEST_KEY` and (optionally) your Wi-Fi into the hub sketch. Run `powershell -ExecutionPolicy Bypass -File .\setup-cloud.ps1` from the Groundwell folder. It saves the key to `cloud\INGEST_KEY.txt`; keep that file private.

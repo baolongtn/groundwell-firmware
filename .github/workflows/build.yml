@@ -52,6 +52,13 @@ jobs:
           curl -sSL -o uf2families.json https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2families.json
           python3 uf2conv.py -c -f 0xADA52840 -o build/node/GroundwellNode.uf2 build/node/GroundwellNode.ino.hex
 
+      - name: Build node test variant (Arduino Nano ESP32)
+        run: |
+          # Same sketch, bench test node: broadcast only, flashed over USB (the hub doesn't update it).
+          arduino-cli compile --warnings default --fqbn esp32:esp32:nano_nora \
+            --output-dir build/node-nano-esp32 node/GroundwellNode 2>&1 | tee build/node-nano-esp32.log
+          test -f build/node-nano-esp32/GroundwellNode.ino.bin
+
       - name: Bundle the node firmware into the hub
         run: python3 tools/make_node_fw_h.py build/node/GroundwellNode.ino.zip
 
@@ -112,4 +119,5 @@ jobs:
             build/node/GroundwellNode.ino.hex
             build/node/GroundwellNode.ino.zip
             build/node/GroundwellNode.uf2
+            build/node-nano-esp32/GroundwellNode.ino.bin
           if-no-files-found: warn

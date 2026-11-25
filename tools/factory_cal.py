@@ -34,6 +34,7 @@ CADENCE_TOL_MS = 500          # each reading must arrive 4.5 to 5.5 s after the 
 WATER_MIN_PCT = 95.0          # verify step: probe in water must read at least this
 AIR_MAX_PCT = 5.0             # verify step: probe back in air must read at most this
 SEEED_VID = 0x2886
+ARDUINO_VID = 0x2341          # Arduino Nano ESP32 test node
 LOG_FIELDS = ["time_utc", "operator", "mac", "fw", "result", "reason", "air", "water", "span",
               "air_sd", "water_sd", "cadence_ms_min", "cadence_ms_max", "verify_water_pct", "verify_air_pct"]
 
@@ -92,12 +93,12 @@ class Node:
 
 
 def find_port():
-    ports = [p for p in serial.tools.list_ports.comports() if p.vid == SEEED_VID]
+    ports = [p for p in serial.tools.list_ports.comports() if p.vid in (SEEED_VID, ARDUINO_VID)]
     if len(ports) == 1:
         return ports[0].device
     if not ports:
-        sys.exit("No XIAO found. Plug the node in by USB, or pass --port (for example --port COM7).")
-    sys.exit("More than one XIAO is plugged in: " + ", ".join(p.device for p in ports) + ". Pass --port.")
+        sys.exit("No node found (XIAO or Nano ESP32). Plug the node in by USB, or pass --port (for example --port COM7).")
+    sys.exit("More than one node is plugged in: " + ", ".join(p.device for p in ports) + ". Pass --port.")
 
 
 def kv(line, key):
