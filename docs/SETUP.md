@@ -198,8 +198,8 @@ Short on XIAOs? The same node sketch builds for an **Arduino Nano ESP32**. It se
 All the analog inputs sit on A0 to A3, the ESP32-S3's ADC1. D0/D1 are the Nano's serial pins, which is why the probe power moves to D2.
 
 **Flash it.**
-1. Board package: **"esp32" 3.x** by Espressif, the one the hub already uses (not 4.0).
-2. Tools > Board > esp32 > **Arduino Nano ESP32**. Leave Tools > Pin Numbering on **By Arduino pin (default)**.
+1. Board package: either works. **"esp32" 3.x** by Espressif (the one the hub already uses; not 4.0), or Arduino's own **"Arduino ESP32 Boards"** (2.0.x), which Arduino IDE offers when you plug in a Nano.
+2. Tools > Board > **Arduino Nano ESP32** (it appears under both packages if you have both). Leave Tools > Pin Numbering on **By Arduino pin (default)**.
 3. Libraries: the same "DHT sensor library". The Bluetooth library comes with the esp32 package.
 4. Upload `node/GroundwellNode`. The banner says `Arduino Nano ESP32 test node: broadcast only`, and the reading lines look like the XIAO's.
 5. Run factory calibration (section 2b). `factory_cal.py` finds a Nano ESP32 by itself, like a XIAO. Calibrate even if you only want raw numbers: its ADC reads differently from the XIAO's, and calibration puts its capacitive probe on the same 0 to 100 scale.
