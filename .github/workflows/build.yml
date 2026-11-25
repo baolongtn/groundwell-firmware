@@ -125,6 +125,7 @@ jobs:
           path: |
             build/hub/GroundwellHub.ino.bin
             build/hub/GroundwellHub.ino.merged.bin
+            build/hub/GroundwellHub.ino.elf
             build/hub-crashtest/GroundwellHub-crashtest.bin
             build/node/GroundwellNode.ino.hex
             build/node/GroundwellNode.ino.zip
