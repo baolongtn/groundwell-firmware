@@ -365,6 +365,7 @@ Firmware files come from the GitHub build: every push to `groundwell-firmware` b
 | `GroundwellHub.ino.bin` | Hub update over Wi-Fi (`/update`) |
 | `GroundwellHub.ino.merged.bin` | Hub first flash over USB with the web flasher (address 0) |
 | `GroundwellHub-crashtest.bin` | Rollback test: a hub build that crashes 20 s after every boot |
+| `GroundwellHub.ino.elf` | Not for flashing: turns a crash's `Backtrace:` line from Serial Monitor into file and line numbers |
 | `GroundwellNode.ino.zip` | Node update over Bluetooth (nRF Connect) |
 | `GroundwellNode.uf2` | Node flash over USB without Arduino IDE: double-tap reset, drag onto the XIAO drive |
 | `node-nano-esp32/GroundwellNode-nano-esp32.bin` | Nano ESP32 test node (section 2c); flashed over USB, never over the air |
