@@ -1,0 +1,118 @@
+name: debug-crash-symbols
+
+# Temporary (delete with its branch): rebuilds the hub exactly as build.yml does, checks the ELF against the
+# crash dump's fingerprint (50a79a00d...), and names the code addresses found in that dump. Only addresses
+# (numbers) are in this branch, never the dump itself.
+
+on:
+  push:
+    branches: [debug/crash-symbols-0.12.0]
+
+jobs:
+  symbols:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host tests (link key HMAC, node update protocol, hub web update check, packets, hub packet handling)
+        run: |
+          cmp node/GroundwellNode/gw_hmac.h hub/GroundwellHub/gw_hmac.h || { echo "gw_hmac.h differs between node and hub"; exit 1; }
+          # The hub reads its own sensors with the node's code (local_sensors.h): fail if the copies drift apart.
+          python3 tools/check_shared_code.py
+          g++ -O2 -Wall -Wextra -o /tmp/hmac_test tools/hmac_test.cpp && /tmp/hmac_test
+          g++ -O2 -Wall -Wextra -o /tmp/node_dfu_test tools/node_dfu_test.cpp && /tmp/node_dfu_test
+          g++ -O2 -Wall -Wextra -o /tmp/ota_check_test tools/ota_check_test.cpp && /tmp/ota_check_test
+          cd tools
+          python3 -c "s=open('../node/GroundwellNode/GroundwellNode.ino').read(); a=s.index('static uint8_t buildBTHome('); b=s.index('// ---- end BTHome packet'); open('node_build.inc','w').write(s[a:b])"
+          g++ -std=c++17 -Wall -o /tmp/roundtrip bthome_roundtrip_test.cpp && /tmp/roundtrip
+          python3 hub_packet_test_extract.py
+          g++ -std=c++17 -Wall -Wno-unused-function -Wno-volatile -o /tmp/hubpkt hub_packet_test.cpp && /tmp/hubpkt
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install board packages and libraries
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli config add board_manager.additional_urls https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
+          arduino-cli core update-index
+          # The hub uses the 3.x BLE API (BLEDevice.h). Core 4.0 replaced it with a new BLE.h API,
+          # so stay on the newest 3.x until the hub is ported.
+          ESP32_V=$(arduino-cli core search esp32:esp32 --all | grep -oE '\b3\.[0-9]+\.[0-9]+\b' | sort -uV | tail -1)
+          echo "Using esp32:esp32@$ESP32_V"
+          arduino-cli core install "esp32:esp32@$ESP32_V"
+          arduino-cli core install Seeeduino:nrf52
+          # Arduino's own package for the Nano ESP32 (2.0.x), which Arduino IDE offers when a Nano is plugged in.
+          arduino-cli core install arduino:esp32
+          arduino-cli lib install "DHT sensor library" "Adafruit Unified Sensor" "Adafruit VEML7700 Library"
+          arduino-cli core list
+          pip install --quiet adafruit-nrfutil
+
+      - name: Build node (XIAO nRF52840)
+        run: |
+          mkdir -p build
+          arduino-cli compile --warnings default --fqbn Seeeduino:nrf52:xiaonRF52840 \
+            --output-dir build/node node/GroundwellNode 2>&1 | tee build/node.log
+          test -f build/node/GroundwellNode.ino.hex
+          test -f build/node/GroundwellNode.ino.zip
+          # UF2 for drag-and-drop flashing: double-tap reset, copy the file onto the XIAO drive.
+          curl -sSL -o uf2conv.py https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2conv.py
+          curl -sSL -o uf2families.json https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2families.json
+          python3 uf2conv.py -c -f 0xADA52840 -o build/node/GroundwellNode.uf2 build/node/GroundwellNode.ino.hex
+
+      - name: Build node test variant (Arduino Nano ESP32)
+        run: |
+          # Same sketch, bench test node: broadcast only, flashed over USB (the hub doesn't update it).
+          arduino-cli compile --warnings default --fqbn esp32:esp32:nano_nora \
+            --output-dir build/node-nano-esp32 node/GroundwellNode 2>&1 | tee build/node-nano-esp32.log
+          test -f build/node-nano-esp32/GroundwellNode.ino.bin
+          # The same build with Arduino's own board package (2.0.x API), so either package in the IDE works.
+          arduino-cli compile --warnings default --fqbn arduino:esp32:nano_nora \
+            --output-dir build/node-nano-esp32-arduino node/GroundwellNode 2>&1 | tee build/node-nano-esp32-arduino.log
+          test -f build/node-nano-esp32-arduino/GroundwellNode.ino.bin
+          # Named files for the artifact, so the Nano's don't get mixed up with the XIAO's.
+          cp build/node-nano-esp32/GroundwellNode.ino.bin build/node-nano-esp32/GroundwellNode-nano-esp32.bin
+          if [ -f build/node-nano-esp32/GroundwellNode.ino.merged.bin ]; then
+            cp build/node-nano-esp32/GroundwellNode.ino.merged.bin build/node-nano-esp32/GroundwellNode-nano-esp32.merged.bin
+          fi
+
+      - name: Bundle the node firmware into the hub (and gzip the hub's pages)
+        run: python3 tools/make_node_fw_h.py build/node/GroundwellNode.ino.zip
+
+      - name: Build hub (XIAO ESP32-C6)
+        run: |
+          # No secrets.h in CI: the hub opens its setup hotspot on first boot.
+          # partitions.csv in the sketch folder gives two 1,966,080-byte app slots; fail the build if the hub outgrows one.
+          # If the hub, node firmware inside, outgrows one slot, build it without the hub's own I2C sensors
+          # (HUB_I2C_SENSORS=0, about 30 KB smaller) rather than fail: a warning and the size report say so.
+          build_hub() {
+            arduino-cli compile --warnings default --fqbn esp32:esp32:XIAO_ESP32C6:PartitionScheme=huge_app --build-property upload.maximum_size=1966080 \
+              --build-property "compiler.cpp.extra_flags=$1" --output-dir build/hub hub/GroundwellHub 2>&1 | tee build/hub.log
+          }
+          if ! build_hub ""; then
+            grep -qi "too big" build/hub.log || exit 1
+            echo "::warning::The hub with the node firmware inside is too big for one update slot: built without the hub's I2C sensors (HUB_I2C_SENSORS=0)"
+            echo "HUB_FLAGS=-DHUB_I2C_SENSORS=0" >> "$GITHUB_ENV"
+            build_hub "-DHUB_I2C_SENSORS=0"
+          fi
+          test -f build/hub/GroundwellHub.ino.bin
+          grep -qa app1 build/hub/GroundwellHub.ino.partitions.bin   # the two-slot table made it into the build
+          grep -q "Node firmware %s bundled" hub/GroundwellHub/GroundwellHub.ino
+          test -f hub/GroundwellHub/pages_gz.h      # the gzipped pages made it in (about 30 KB less flash)
+
+      - name: Name the crash dump's addresses
+        run: |
+          ELF=build/hub/GroundwellHub.ino.elf
+          T=$(dirname "$(find ~/.arduino15 -name riscv32-esp-elf-addr2line | head -1)")
+          echo "ELF_SHA256=$(sha256sum $ELF | cut -c1-64)   (crash dump: 50a79a00d...)"
+          echo "=== addr2line"
+          $T/riscv32-esp-elf-addr2line -pfiaC -e $ELF $(cat tools/debug_addrs.txt)
+          echo "=== call check: the instruction ending at each address"
+          for a in $(cat tools/debug_addrs.txt); do
+            s=$(printf '0x%x' $(( a - 8 ))); e=$(printf '0x%x' $(( a + 2 )))
+            echo "--- $a"; $T/riscv32-esp-elf-objdump -d --start-address=$s --stop-address=$e $ELF | grep -E '^ *[0-9a-f]+:' | tail -4
+          done
+          echo "=== around the abort call"
+          $T/riscv32-esp-elf-objdump -d --start-address=0x42121140 --stop-address=0x421211a0 $ELF | tail -30
+          echo "=== sizes"
+          $T/riscv32-esp-elf-size -A $ELF | grep -E "dram0|iram0|flash.text|flash.rodata"
