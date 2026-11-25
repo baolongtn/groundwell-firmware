@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL sensor node v0.10.0  (two soil probes + air temperature/humidity + light + UV, one board)
+  GROUNDWELL sensor node v0.11.0  (two soil probes + air temperature/humidity + light + UV, one board)
   Board:  Seeed XIAO nRF52840 (plain or Sense)
           Arduino IDE: Boards Manager URL
             https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
@@ -17,6 +17,9 @@
     From a phone: for DFU_WINDOW_MS (10 min) after power-up or a reset, the node advertises continuously and
     accepts an update without the key: nRF Connect for Mobile > connect to "GW" > DFU > GroundwellNode.ino.zip.
     Serial command UNLINK forgets the link key.
+  Diagnostics (v0.11): a read-only characteristic reports uptime, why it last restarted, readings sent,
+  air-sensor read failures, sensors, calibration, link, update window, radio power, interval, connections
+  and failed link-key attempts. The hub reads it at each check and shows it on http://plants.local/diag.
 
   What it does
     Every REPORT_MS (30 s) it reads both probes, air temperature/humidity and light, then broadcasts one
@@ -95,7 +98,7 @@
     corrode, and soil polarization cancels out.
 */
 
-static const char *FW_VERSION = "0.10.0";
+static const char *FW_VERSION = "0.11.0";
 
 // ---------------- light sensor choice ----------------
 #define LIGHT_LDR      1                         // GL5539 photoresistor + DHT11, no I2C (the parts in hand)
@@ -189,6 +192,8 @@ static volatile bool keyOk = false, keyDirty = false, authed = false;
 static uint8_t nonce[16];
 static float lastVdd = 0;
 static SemaphoreHandle_t wakeSem;                    // lets a Bluetooth event wake the main loop early
+// Diagnostics (v0.11)
+static uint32_t readings = 0, airFails = 0, connects = 0, authFails = 0;
 static uint32_t fastUntil = 0;                        // FAST command: 5 s readings until this millis()
 // Declared here, before any function: the Arduino IDE puts a prototype of every function above the first one.
 struct AirFilter { bool have, pend; float t, h, pt, ph; };
@@ -667,6 +672,8 @@ BLECharacteristic gwInfo(UUID_GW_INFO);              // read: "0.10.0;l=1;w=0;v=
 BLECharacteristic gwNonce(UUID_GW_NONCE);            // read: 16 random bytes, new for every connection and attempt
 BLECharacteristic gwAuth(UUID_GW_AUTH);              // write: first 16 bytes of HMAC-SHA256(link key, nonce)
 BLECharacteristic gwKey(UUID_GW_KEY);                // write: a new 16-byte link key (in the window, or once authenticated)
+static const uint8_t UUID_GW_DIAG[16] = GW_UUID(0x06);
+BLECharacteristic gwDiag(UUID_GW_DIAG);              // read: "up=..;rst=..;n=..;..." node health for the hub's diagnostics page
 
 
 static uint32_t keyCheck(const KeyData &k) {
@@ -711,6 +718,28 @@ static void newNonce() {
   gwNonce.write(nonce, sizeof nonce);
 }
 
+static const char *resetReasonText() {
+  uint32_t r = readResetReason();                  // NRF_POWER->RESETREAS, saved by the core at startup
+  if (r & 0x1) return "reset-pin";
+  if (r & 0x2) return "watchdog";
+  if (r & 0x4) return "software";                  // includes the restart after an update
+  if (r & 0x8) return "lockup";
+  if (r & 0x10000) return "wake-from-off";
+  if (r & 0x100000) return "usb-power";
+  return "power-on";
+}
+
+static void updateDiag() {
+  char b[160];
+  uint32_t winLeft = dfuWindowOpen() ? (DFU_WINDOW_MS - millis()) / 1000 : 0;
+  bool fast = fastUntil && (int32_t)(fastUntil - millis()) > 0;
+  snprintf(b, sizeof b, "up=%lu;rst=%s;n=%lu;air=%s;airfail=%lu;light=%s;cal=%d;link=%d;win=%lu;tx=%d;ivl=%lu;con=%lu;authfail=%lu",
+           (unsigned long)(millis() / 1000), resetReasonText(), (unsigned long)readings, airSrc, (unsigned long)airFails, lightName(),
+           calOk ? 1 : 0, keyOk ? 1 : 0, (unsigned long)winLeft, (int)TX_POWER_DBM,
+           (unsigned long)((fast ? FAST_REPORT_MS : REPORT_MS) / 1000), (unsigned long)connects, (unsigned long)authFails);
+  gwDiag.write(b);
+}
+
 static void updateInfo() {
   char b[40];
   snprintf(b, sizeof b, "%s;l=%d;w=%d;v=%.2f", FW_VERSION, keyOk ? 1 : 0, dfuWindowOpen() ? 1 : 0, lastVdd);
@@ -735,7 +764,7 @@ static void authWriteCb(uint16_t conn, BLECharacteristic *, ble_gatts_evt_write_
     ok = gw_equal(mac, r->data, 16);
   }
   replyWrite(conn, ok);
-  if (ok) authed = true;
+  if (ok) authed = true; else authFails++;
   newNonce();                                        // one guess per nonce
 }
 
@@ -751,7 +780,7 @@ static void keyWriteCb(uint16_t conn, BLECharacteristic *, ble_gatts_evt_write_t
   updateInfo();
 }
 
-static void connectCb(uint16_t) { authed = false; newNonce(); updateInfo(); }
+static void connectCb(uint16_t) { authed = false; connects++; newNonce(); updateInfo(); updateDiag(); }
 static void disconnectCb(uint16_t, uint8_t) { authed = false; newNonce(); }
 
 static void serviceLink() {
@@ -830,6 +859,7 @@ static void beginLinkServices() {
   gwAuth.setWriteAuthorizeCallback(authWriteCb); gwAuth.begin();
   gwKey.setProperties(CHR_PROPS_WRITE);   gwKey.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);   gwKey.setFixedLen(16);
   gwKey.setWriteAuthorizeCallback(keyWriteCb); gwKey.begin();
+  gwDiag.setProperties(CHR_PROPS_READ);   gwDiag.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);  gwDiag.setMaxLen(160); gwDiag.begin();
 
   dfuSvc.begin();
   BLECharacteristic pkt(UUID_DFU_PKT);
@@ -843,6 +873,7 @@ static void beginLinkServices() {
   Bluefruit.Periph.setDisconnectCallback(disconnectCb);
   newNonce();
   updateInfo();
+  updateDiag();
 }
 
 static void advertise(const uint8_t *svc, uint8_t len) {
@@ -850,6 +881,7 @@ static void advertise(const uint8_t *svc, uint8_t len) {
   // may do is decided by the link key and the window after a reset. In that window the node advertises
   // continuously, for phones. While connected, the reading still goes out as a non-connectable burst.
   updateInfo();
+  updateDiag();
   bool connectable = Bluefruit.connected() == 0;
   bool continuous = connectable && dfuWindowOpen();
   Bluefruit.Advertising.stop();
@@ -928,6 +960,8 @@ void loop() {
   lastVdd       = vdd;
   float tempC = 0, rh = 0;
   bool airRead  = readAir(tempC, rh);
+  readings++;
+  if (!airRead) airFails++;
   static AirFilter airF = {false, false, 0, 0, 0, 0};
   bool airOk    = airRead && airFilter(airF, tempC, rh);
   float lux = 0;

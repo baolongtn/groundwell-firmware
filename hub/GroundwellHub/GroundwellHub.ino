@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL hub v0.10.0
+  GROUNDWELL hub v0.11.0
   Board: Seeed XIAO ESP32-C6, Arduino core "esp32 by Espressif Systems" 3.x (NOT 4.x: it replaced the BLE API),
          board "XIAO_ESP32C6", Tools > Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)".
          The menu only sets the IDE's size check: partitions.csv in this folder replaces the layout with two
@@ -16,6 +16,10 @@
       one at a time, only on a healthy battery. Status per node: dashboard (Admin) and /update.
     - Linking: a node learns this hub's link key in the 10 minutes after its power-up or reset. After that
       only this hub (proving the key) can update it. A node linked elsewhere: press its reset button once.
+  Diagnostics (v0.11)
+    - http://plants.local/diag (Admin > Diagnostics): what the hub is doing now, hub, Wi-Fi, Bluetooth and
+      cloud state, every node's traffic, signal, battery, firmware and update status, what each node reports
+      about itself, the probes, and an event log. "Download snapshot" saves it all as one file for debugging.
   Setup page (v0.9.1)
     - Wi-Fi, cloud URL, ingest key and the update password live in the hub's own memory, set on /setup.
     - No Wi-Fi saved, or none found within 3 minutes of power-up, or the BOOT button held for 3 s:
@@ -65,6 +69,7 @@
 #include <time.h>
 #include "bthome.h"
 #include "page.h"
+#include "diag_page.h"
 #include "gw_hmac.h"
 #include "node_dfu.h"
 #if __has_include("node_fw.h")
@@ -90,9 +95,9 @@
   #define GW_CRASH_TEST 0      // 1 = rollback test build: crashes 20 s after every boot (the GitHub build makes one)
 #endif
 #if GW_CRASH_TEST
-  #define GW_FW_VERSION "0.10.0-crashtest"
+  #define GW_FW_VERSION "0.11.0-crashtest"
 #else
-  #define GW_FW_VERSION "0.10.0"
+  #define GW_FW_VERSION "0.11.0"
 #endif
 static const char *FW_VERSION = GW_FW_VERSION;
 // Optional secrets.h (git-ignored): WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY and optionally OTA_PASS.
@@ -171,6 +176,15 @@ struct Node {
   uint32_t nextCheckAt;          // millis() of the next check (0 = soon)
   uint8_t fails;                 // failed updates in a row (sets the backoff)
   uint32_t rescueAt;             // after a failed transfer: look for its bootloader if it doesn't come back
+  // diagnostics (v0.11)
+  uint32_t firstSeen, adv;       // when first heard; every advert heard, repeats included
+  uint16_t restarts;             // restarts seen (packet id back to the start)
+  int8_t rssiMin, rssiMax;
+  bool online;                   // for the online/offline events
+  uint32_t lastCheckAt;          // last completed check or update job
+  uint16_t checks;
+  char diag[160];                // what the node reported about itself at the last check
+  uint32_t diagAt;
 };
 
 struct Sensor {
@@ -243,6 +257,43 @@ bool trialActive = false;                    // this firmware is new and hasn't 
 uint8_t nodeKey[16];                         // this hub's link key for its nodes (random, made on first boot)
 volatile bool jobBusy = false;               // a node check or update is running (Bluetooth scan paused)
 uint32_t jobStartedAt = 0;
+
+// ---------------- event log and counters (v0.11) ----------------
+struct LogEnt { uint32_t ms, epoch; char t[100]; };
+static const int LOG_LEN = 60;
+LogEnt logBuf[LOG_LEN];
+int logHead = 0, logCount = 0;
+SemaphoreHandle_t logLock;
+volatile uint32_t btAll = 0;                 // every Bluetooth advert heard, any device
+volatile uint32_t freshTotal = 0;            // new readings from GROUNDWELL nodes
+uint32_t uploadsOk = 0, uploadsFail = 0, lastUploadAt = 0, lastUploadMs = 0, wifiUps = 0, wifiDownAt = 0;
+char lastUploadErr[100] = "";
+bool lastUploadGood = false;
+
+static void logEvent(const char *fmt, ...) {   // Serial Monitor and the diagnostics page's event log
+  char b[sizeof logBuf[0].t];
+  va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+  Serial.println(b);
+  if (!logLock) return;
+  time_t now = time(nullptr);
+  xSemaphoreTake(logLock, portMAX_DELAY);
+  LogEnt &e = logBuf[logHead];
+  e.ms = millis();
+  e.epoch = now > 1700000000 ? (uint32_t)now : 0;
+  strlcpy(e.t, b, sizeof e.t);
+  logHead = (logHead + 1) % LOG_LEN;
+  if (logCount < LOG_LEN) logCount++;
+  xSemaphoreGive(logLock);
+}
+
+static const char *espResetText(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON: return "power-on"; case ESP_RST_EXT: return "reset pin"; case ESP_RST_SW: return "software restart";
+    case ESP_RST_PANIC: return "crash"; case ESP_RST_INT_WDT: return "interrupt watchdog"; case ESP_RST_TASK_WDT: return "loop watchdog";
+    case ESP_RST_WDT: return "watchdog"; case ESP_RST_DEEPSLEEP: return "deep sleep"; case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_USB: return "USB"; default: return "other";
+  }
+}
 
 // ---------------- helpers ----------------
 static int clampPct(long p) { return p < 0 ? 0 : (p > 100 ? 100 : (int)p); }
@@ -334,13 +385,26 @@ static void handlePacket(const char *mac, int rssi, uint8_t addrType, bool conne
     n.addrType = addrType;
     n.connectable = connectable;
     n.rescueAt = 0;                                       // it's running its app again
+    n.adv++;
+    if (!n.firstSeen) {
+      n.firstSeen = millis() | 1;
+      n.rssiMin = n.rssiMax = (int8_t)rssi;
+      logEvent("Node %s first heard (%d dBm)", mac, rssi);
+    }
+    if (rssi < n.rssiMin) n.rssiMin = (int8_t)rssi;
+    if (rssi > n.rssiMax) n.rssiMax = (int8_t)rssi;
     bool fresh = !p.hasPid || !n.havePid || p.pid != n.lastPid;
     if (fresh) {
       advFresh++;
+      freshTotal++;
       if (p.hasPid && n.havePid) {
         uint8_t gap = (uint8_t)(p.pid - n.lastPid);
         if (gap > 1 && gap < 50) n.lost += gap - 1;      // bigger jumps = node rebooted
-        if (p.pid <= 2 && n.lastPid > 2 && !n.updating) n.nextCheckAt = 0;   // just restarted: its link window is open, check now
+        if (p.pid <= 2 && n.lastPid > 2 && !n.updating) {   // just restarted: its link window is open, check now
+          n.nextCheckAt = 0;
+          n.restarts++;
+          logEvent("Node %s restarted", mac);
+        }
       }
       if (p.hasPid) { n.lastPid = p.pid; n.havePid = true; }
       n.rx++;
@@ -405,6 +469,7 @@ static void handlePacket(const char *mac, int rssi, uint8_t addrType, bool conne
 
 class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice dev) override {
+    btAll++;
     for (int i = 0; i < dev.getServiceDataCount(); i++) {
       if (!dev.getServiceDataUUID(i).equals(BLEUUID((uint16_t)0xFCD2))) continue;
       auto sd = dev.getServiceData(i);                   // String (core 3.x) or std::string (2.x)
@@ -509,6 +574,7 @@ static void uploadBatch() {
 
   int code = -1;
   char tlsErr[100] = "";
+  uint32_t uploadStart = millis();
   String reply;
   uint32_t freeHeap = ESP.getFreeHeap(), maxBlock = ESP.getMaxAllocHeap();
   if (freeHeap < 50000 || maxBlock < 20000) {
@@ -534,6 +600,20 @@ static void uploadBatch() {
 
   scan->start(0, nullptr, false);
   lastUploadCode = code;
+  lastUploadAt = millis();
+  lastUploadMs = lastUploadAt - uploadStart;
+  if (code == 200) {
+    uploadsOk++;
+    if (!lastUploadGood) logEvent(uploadsOk == 1 ? "Cloud upload OK (%d readings)" : "Cloud upload OK again (%d readings)", n);
+    lastUploadGood = true;
+    lastUploadErr[0] = 0;
+  } else {
+    uploadsFail++;
+    snprintf(lastUploadErr, sizeof lastUploadErr, "%s%s%s", code == -100 ? "too little free memory" : code < 0 ? HTTPClient::errorToString(code).c_str() : "HTTP error",
+             tlsErr[0] ? " / TLS: " : "", tlsErr);
+    if (lastUploadGood || uploadsFail == 1) logEvent("Cloud upload failed: HTTP %d %s", code, lastUploadErr);
+    lastUploadGood = false;
+  }
   if (code == 200) {
     xSemaphoreTake(lock, portMAX_DELAY);
     int drop = n < qCount ? n : qCount;                 // readings that arrived meanwhile stay queued
@@ -706,7 +786,7 @@ static void applyCloudCfg(const String &resp) {
     applied++;
   }
   xSemaphoreGive(lock);
-  if (applied) Serial.printf("  applied %d calibration change(s) from the cloud dashboard\n", applied);
+  if (applied) logEvent("Applied %d calibration change(s) from the cloud dashboard", applied);
 }
 
 static bool adminOk() { return strlen(ADMIN_PIN) == 0 || server.arg("pin") == ADMIN_PIN; }
@@ -782,8 +862,8 @@ static void openSetup(uint32_t forMs, const char *why) {
     WiFi.softAP(apName().c_str(), SETUP_AP_PASS);
     dns.start(53, "*", WiFi.softAPIP());          // every name points at the hub, so phones show the setup page
     apOn = true;
-    Serial.printf("Setup hotspot open (%s): join \"%s\" (password \"%s\"), then open http://%s/setup\n",
-                  why, apName().c_str(), SETUP_AP_PASS, WiFi.softAPIP().toString().c_str());
+    logEvent("Setup hotspot open (%s): join \"%s\", then open http://%s/setup", why, apName().c_str(), WiFi.softAPIP().toString().c_str());
+    Serial.printf("  hotspot password: \"%s\"\n", SETUP_AP_PASS);
   }
   apIdleSince = 0;
   if (forMs) apCloseAt = (millis() + forMs) | 1;
@@ -795,7 +875,7 @@ static void closeSetup() {
   WiFi.softAPdisconnect(true);
   apOn = false;
   apCloseAt = 0;
-  Serial.println("Setup hotspot closed");
+  logEvent("Setup hotspot closed");
 }
 
 static bool fromHotspot() { return apOn && server.client().localIP() == WiFi.softAPIP(); }
@@ -825,13 +905,13 @@ static void trialCheckAtBoot() {
   bool crash = r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
   uint8_t crashes = otaPrefs.getUChar("crashes", 0) + (crash ? 1 : 0);
   otaPrefs.putUChar("crashes", crashes);
-  if (crash) Serial.printf("Firmware %s on trial: crash %u of %u (reset reason %d)\n", FW_VERSION, crashes, TRIAL_CRASHES, (int)r);
+  if (crash) logEvent("Firmware %s on trial: crash %u of %u (%s)", FW_VERSION, crashes, TRIAL_CRASHES, espResetText(r));
   if (crashes >= TRIAL_CRASHES) {
     String back = otaPrefs.getString("prevVer", "the previous firmware");
     otaPrefs.putBool("trial", false);
     if (Update.rollBack()) {
       otaPrefs.putString("note", String("Firmware ") + FW_VERSION + " crashed " + crashes + " times on trial, so the hub went back to " + back + ".");
-      Serial.printf("Going back to firmware %s\n", back.c_str());
+      logEvent("Going back to firmware %s", back.c_str());
       delay(200);
       ESP.restart();
     }
@@ -848,7 +928,7 @@ static void trialMaybeConfirm() {   // proven: 10 minutes up, on Wi-Fi, a node h
   trialActive = false;
   otaPrefs.putBool("trial", false);
   otaPrefs.putString("note", String("Firmware ") + FW_VERSION + " passed its trial.");
-  Serial.printf("Firmware %s passed its trial\n", FW_VERSION);
+  logEvent("Firmware %s passed its trial", FW_VERSION);
 }
 
 static void startWatchdog() {   // a hang counts as a crash: the loop must come round within WATCHDOG_MS
@@ -881,7 +961,7 @@ static String htmlEsc(const String &s) {
 static void sendPage(int code, const String &body) {
   String h = FPSTR(PAGE_HEAD);
   h += body;
-  h += "<p class=note>Firmware "; h += FW_VERSION; h += " · <a href=/>Dashboard</a> · <a href=/update>Update</a> · <a href=/setup>Settings</a></p></body></html>";
+  h += "<p class=note>Firmware "; h += FW_VERSION; h += " · <a href=/>Dashboard</a> · <a href=/diag>Diagnostics</a> · <a href=/update>Update</a> · <a href=/setup>Settings</a></p></body></html>";
   server.send(code, "text/html", h);
 }
 
@@ -928,6 +1008,7 @@ static void handleSetupSave() {
   cfgPrefs.putString("url", url);
   if (key.length()) cfgPrefs.putString("key", key);
   if (otapw.length()) cfgPrefs.putString("otapw", otapw);
+  logEvent("Settings saved on /setup: restarting to join %s", ssid.c_str());
   sendPage(200, "<p class=msg>Saved. The hub is restarting and will join <b>" + htmlEsc(ssid) +
                 "</b>. On that network the dashboard is at <a href=http://" HOSTNAME ".local/>http://" HOSTNAME ".local/</a>.</p>");
   delay(1500);
@@ -1017,7 +1098,7 @@ static void handleUpdateUpload() {
     if (Update.isRunning()) Update.abort();
     upErr = "Upload interrupted. Nothing was changed.";
     if (otaBusy) { otaBusy = false; scan->start(0, nullptr, false); }
-    Serial.println("Web update interrupted: nothing changed");
+    logEvent("Web update interrupted: nothing changed");
   }
 }
 
@@ -1028,12 +1109,12 @@ static void handleUpdateDone() {
     if (Update.isRunning()) Update.abort();
     if (otaBusy) { otaBusy = false; scan->start(0, nullptr, false); }
     server.send(400, "text/plain", upErr + " The hub keeps running " + FW_VERSION + ".");
-    Serial.printf("Web update failed: %s\n", upErr.c_str());
+    logEvent("Web update failed: %s", upErr.c_str());
     return;
   }
   trialStart();
   server.send(200, "text/plain", "Done. The hub is restarting into the new firmware; this page reloads in about 25 s.");
-  Serial.println("Web update written: restarting into the new firmware");
+  logEvent("Web update written: restarting into the new firmware");
   delay(800);
   ESP.restart();
 }
@@ -1043,10 +1124,10 @@ static void startArduinoOta() {   // Arduino IDE network uploads, with the same 
   ArduinoOTA.setHostname(HOSTNAME);
   ArduinoOTA.setPassword(cfg.otapw.c_str());
   ArduinoOTA.setMdnsEnabled(false);                 // the hub runs mDNS itself (see loop)
-  ArduinoOTA.onStart([]() { otaBusy = true; scan->stop(); Serial.println("Arduino IDE upload started"); });
+  ArduinoOTA.onStart([]() { otaBusy = true; scan->stop(); logEvent("Arduino IDE upload started"); });
   ArduinoOTA.onProgress([](unsigned int, unsigned int) { esp_task_wdt_reset(); });
-  ArduinoOTA.onEnd([]() { trialStart(); Serial.println("Arduino IDE upload done: restarting into the new firmware"); });
-  ArduinoOTA.onError([](ota_error_t e) { otaBusy = false; if (!jobBusy) scan->start(0, nullptr, false); Serial.printf("Arduino IDE upload failed (error %u)\n", (unsigned)e); });
+  ArduinoOTA.onEnd([]() { trialStart(); logEvent("Arduino IDE upload done: restarting into the new firmware"); });
+  ArduinoOTA.onError([](ota_error_t e) { otaBusy = false; if (!jobBusy) scan->start(0, nullptr, false); logEvent("Arduino IDE upload failed (error %u)", (unsigned)e); });
   ArduinoOTA.begin();
   arduinoOtaUp = true;
 }
@@ -1060,6 +1141,7 @@ static const char *GW_INFO  = "6a1c0002-5f2b-4c1e-9d55-67726f756e64";
 static const char *GW_NONCE = "6a1c0003-5f2b-4c1e-9d55-67726f756e64";
 static const char *GW_AUTH  = "6a1c0004-5f2b-4c1e-9d55-67726f756e64";
 static const char *GW_KEY   = "6a1c0005-5f2b-4c1e-9d55-67726f756e64";
+static const char *GW_DIAG  = "6a1c0006-5f2b-4c1e-9d55-67726f756e64";
 static const char *DFU_SVC  = "00001530-1212-efde-1523-785feabcd123";
 static const char *DFU_CTRL = "00001531-1212-efde-1523-785feabcd123";
 static const char *DFU_PKT  = "00001532-1212-efde-1523-785feabcd123";
@@ -1108,7 +1190,7 @@ static void nodeStatus(int i, const char *fmt, ...) {
   xSemaphoreTake(lock, portMAX_DELAY);
   strlcpy(nodes[i].st, b, sizeof nodes[i].st);
   xSemaphoreGive(lock);
-  Serial.printf("Node %s: %s\n", nodes[i].mac + 12, b);
+  logEvent("Node %s: %s", nodes[i].mac + 9, b);
 }
 
 static bool nodeConnect(const char *mac, uint8_t type, bool plusOne, uint32_t ms) {
@@ -1165,7 +1247,7 @@ static uint32_t nodeTransfer(int i, const char *mac, uint8_t type, bool small) {
   link.ctrl->registerForNotify(onDfuNotify);
   uint16_t mtu = nodeClient->getMTU();
   uint16_t pkt = (small || mtu <= 23) ? 20 : (uint16_t)((mtu - 3 > 244 ? 244 : mtu - 3) & ~3);
-  Serial.printf("Node %s: sending %lu bytes in %u-byte packets (MTU %u)\n", mac + 12, (unsigned long)NODE_FW_LEN, pkt, mtu);
+  logEvent("Node %s: sending %lu bytes in %u-byte packets (MTU %u)", mac + 9, (unsigned long)NODE_FW_LEN, pkt, mtu);
   uint32_t t0 = millis();
   char err[96];
   const char *e = dfuTransfer(link, NODE_FW_BIN, NODE_FW_LEN, NODE_FW_DAT, NODE_FW_DAT_LEN, pkt, 8, err, sizeof err);
@@ -1199,6 +1281,16 @@ static uint32_t nodeCheck(int i, const char *mac, uint8_t type, float volt, bool
     window = info.indexOf(";w=1") >= 0;
     int vi = info.indexOf(";v=");
     if (vi >= 0) v = info.substring(vi + 3).toFloat();
+    BLERemoteCharacteristic *cd = gw->getCharacteristic(BLEUUID(GW_DIAG));   // node 0.11+: its own health report
+    if (cd) {
+      String d = cd->readValue();
+      xSemaphoreTake(lock, portMAX_DELAY);
+      size_t k = 0;
+      for (size_t c = 0; c < d.length() && k < sizeof nodes[i].diag - 1; c++) { char ch = d[c]; if (ch >= 32 && ch < 127 && ch != '"' && ch != '\\') nodes[i].diag[k++] = ch; }
+      nodes[i].diag[k] = 0;
+      nodes[i].diagAt = millis() | 1;
+      xSemaphoreGive(lock);
+    }
   } else {                                         // before v0.10: version from Device Information
     BLERemoteService *dis = nodeClient->getService(BLEUUID((uint16_t)0x180A));
     BLERemoteCharacteristic *cs = dis ? dis->getCharacteristic(BLEUUID((uint16_t)0x2A28)) : nullptr;
@@ -1276,6 +1368,8 @@ static void nodeJobTask(void *) {
     next = nodeCheck(i, mac, type, volt, small);
   }
   nodes[i].nextCheckAt = (millis() + next) | 1;
+  nodes[i].lastCheckAt = millis() | 1;
+  nodes[i].checks++;
   scan->start(0, nullptr, false);
   jobBusy = false;
   vTaskDelete(NULL);
@@ -1286,7 +1380,7 @@ static void nodeJobTask(void *) {
 static void nodeUpdaterLoop() {
   uint32_t now = millis();
   if (jobBusy) {
-    if (now - jobStartedAt > JOB_MAX_MS) { Serial.println("Node update stuck: restarting the hub"); delay(200); ESP.restart(); }
+    if (now - jobStartedAt > JOB_MAX_MS) { logEvent("Node job stuck for 8 min: restarting the hub"); delay(200); ESP.restart(); }
     return;
   }
   if (otaBusy || now < 60000 || !nodeClient) return;   // let the hub settle after boot
@@ -1315,11 +1409,195 @@ static void nodeUpdaterLoop() {
   if (xTaskCreate(nodeJobTask, "gwnode", 8192, nullptr, 1, nullptr) != pdPASS) { jobBusy = false; scan->start(0, nullptr, false); }
 }
 
+// ---------------- diagnostics page (v0.11) ----------------
+static void jsonStr(String &j, const char *s) {    // a JSON string, escaped
+  j += '"';
+  for (; *s; s++) {
+    char c = *s;
+    if (c == '"' || c == '\\') { j += '\\'; j += c; }
+    else if ((uint8_t)c < 32) j += ' ';
+    else j += c;
+  }
+  j += '"';
+}
+static void jsonKV(String &j, const char *k, const char *v) { j += '"'; j += k; j += "\":"; jsonStr(j, v); j += ','; }
+static void jsonKV(String &j, const char *k, long v) { j += '"'; j += k; j += "\":"; j += v; j += ','; }
+static void jsonKB(String &j, const char *k, bool v) { j += '"'; j += k; j += "\":"; j += v ? "true" : "false"; j += ','; }
+static void jsonEnd(String &j, char close) { if (j.endsWith(",")) j.remove(j.length() - 1); j += close; }
+static long ageS(uint32_t now, uint32_t at) { return at ? (long)((now - at) / 1000) : -1L; }
+
+static String activityNow() {
+  if (otaBusy) return "Receiving a hub firmware update";
+  if (jobBusy && jobNode >= 0) {
+    Node &n = nodes[jobNode];
+    if (n.updating) return String("Updating node ") + n.mac + ": " + n.pct + "%";
+    return String(jobRescue ? "Looking for the bootloader of node " : "Checking node ") + n.mac;
+  }
+  if (apOn && WiFi.softAPgetStationNum()) return "Setup page in use on the hotspot";
+  if (WiFi.status() != WL_CONNECTED) return cfg.ssid.length() ? "Waiting for Wi-Fi" : "Waiting for setup (hotspot open)";
+  return "Listening for nodes";
+}
+
+static void handleDiagPage() { if (setupAuthOk()) server.send_P(200, "text/html", DIAG_PAGE); }
+
+static void handleDiagCheck() {                    // POST i=<node>: check that node at its next burst
+  if (!setupAuthOk()) return;
+  int i = server.arg("i").toInt();
+  if (i < 0 || i >= MAX_NODES || !nodes[i].used) { server.send(400, "text/plain", "bad node"); return; }
+  nodes[i].nextCheckAt = 0;
+  logEvent("Node %s: check requested from the diagnostics page", nodes[i].mac);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handleDiagApi() {
+  if (!setupAuthOk()) return;
+  uint32_t now = millis();
+  time_t epoch = time(nullptr);
+  const esp_partition_t *run = esp_ota_get_running_partition();
+  String j;
+  j.reserve(14000);
+  j += '{';
+  jsonKV(j, "now", activityNow().c_str());
+  jsonKV(j, "uptimeS", (long)(now / 1000));
+  jsonKV(j, "epoch", epoch > 1700000000 ? (long)epoch : 0L);
+  j += "\"hub\":{";
+  jsonKV(j, "fw", FW_VERSION);
+  jsonKV(j, "slot", run ? run->label : "?");
+  jsonKB(j, "trial", trialActive);
+  jsonKV(j, "reset", espResetText(esp_reset_reason()));
+  jsonKV(j, "heap", (long)ESP.getFreeHeap());
+  jsonKV(j, "heapMin", (long)ESP.getMinFreeHeap());
+  jsonKV(j, "heapBlock", (long)ESP.getMaxAllocHeap());
+  jsonKV(j, "sketch", (long)ESP.getSketchSize());
+  jsonKV(j, "slotSize", run ? (long)run->size : 0L);
+  jsonKV(j, "nodeFw", NODE_FW_VERSION);
+  jsonKV(j, "nodeFwLen", (long)NODE_FW_LEN);
+  jsonKV(j, "note", otaPrefs.getString("note", "").c_str());
+  jsonEnd(j, '}'); j += ',';
+  bool wup = WiFi.status() == WL_CONNECTED;
+  j += "\"wifi\":{";
+  jsonKB(j, "up", wup);
+  jsonKV(j, "ssid", cfg.ssid.c_str());
+  jsonKV(j, "ip", wup ? WiFi.localIP().toString().c_str() : "");
+  jsonKV(j, "rssi", wup ? (long)WiFi.RSSI() : 0L);
+  jsonKV(j, "ch", wup ? (long)WiFi.channel() : 0L);
+  jsonKV(j, "bssid", wup ? WiFi.BSSIDstr().c_str() : "");
+  jsonKV(j, "mac", WiFi.macAddress().c_str());
+  jsonKV(j, "host", HOSTNAME ".local");
+  jsonKB(j, "mdns", mdnsUp);
+  jsonKV(j, "ups", (long)wifiUps);
+  jsonKV(j, "downS", ageS(now, wifiDownAt));
+  jsonKB(j, "hotspot", apOn);
+  jsonKV(j, "hsName", apOn ? apName().c_str() : "");
+  jsonKV(j, "hsClients", apOn ? (long)WiFi.softAPgetStationNum() : 0L);
+  jsonKB(j, "arduinoOta", arduinoOtaUp);
+  jsonKB(j, "updatePw", cfg.otapw.length() > 0);
+  jsonEnd(j, '}'); j += ',';
+  j += "\"ble\":{";
+  jsonKB(j, "scanning", scan && scan->isScanning());
+  jsonKV(j, "all", (long)btAll);
+  jsonKV(j, "gw", (long)advTotal);
+  jsonKV(j, "fresh", (long)freshTotal);
+  jsonKV(j, "intervalMs", 100L);                   // scan->setInterval(160) x 0.625 ms
+  jsonKV(j, "windowMs", 50L);
+  jsonKB(j, "job", jobBusy);
+  jsonKV(j, "jobNode", jobBusy && jobNode >= 0 ? nodes[jobNode].mac : "");
+  jsonKV(j, "jobS", jobBusy ? ageS(now, jobStartedAt) : -1L);
+  jsonEnd(j, '}'); j += ',';
+  j += "\"cloud\":{";
+  jsonKB(j, "on", cfg.url.length() > 0);
+  jsonKV(j, "url", cfg.url.c_str());
+  jsonKB(j, "clock", epoch > 1700000000);
+  jsonKV(j, "code", (long)lastUploadCode);
+  jsonKV(j, "lastS", ageS(now, lastUploadAt));
+  jsonKV(j, "okS", ageS(now, lastUploadOk));
+  jsonKV(j, "ms", (long)lastUploadMs);
+  jsonKV(j, "ok", (long)uploadsOk);
+  jsonKV(j, "fail", (long)uploadsFail);
+  jsonKV(j, "err", lastUploadErr);
+  jsonKV(j, "sent", (long)uploadedTotal);
+  jsonKV(j, "q", (long)qCount); jsonKV(j, "qMax", (long)QUEUE_LEN);
+  jsonKV(j, "c", (long)cCount); jsonKV(j, "cMax", (long)CLIM_LEN);
+  jsonKV(j, "l", (long)lCount); jsonKV(j, "lMax", (long)LIGHT_LEN);
+  jsonEnd(j, '}'); j += ',';
+  xSemaphoreTake(lock, portMAX_DELAY);
+  j += "\"nodes\":[";
+  for (int i = 0; i < MAX_NODES; i++) {
+    Node &n = nodes[i];
+    if (!n.used) continue;
+    uint32_t tot = n.rx + n.lost;
+    String probes;
+    for (int k = 0; k < MAX_SENSORS; k++) if (sensors[k].used && sensors[k].node == i) { if (probes.length()) probes += ", "; probes += sensors[k].name; }
+    j += '{';
+    jsonKV(j, "i", (long)i);
+    jsonKV(j, "mac", n.mac);
+    jsonKV(j, "type", n.addrType == 1 ? "random" : n.addrType == 0 ? "public" : "other");
+    jsonKV(j, "probes", probes.c_str());
+    jsonKB(j, "online", now - n.lastSeen < STALE_MS);
+    jsonKV(j, "seenS", ageS(now, n.lastSeen));
+    jsonKV(j, "freshS", ageS(now, n.lastFreshAt));
+    jsonKV(j, "firstS", ageS(now, n.firstSeen));
+    jsonKV(j, "adv", (long)n.adv);
+    jsonKV(j, "rx", (long)n.rx);
+    jsonKV(j, "lost", (long)n.lost);
+    jsonKV(j, "lossX10", tot ? (long)(1000ULL * n.lost / tot) : 0L);
+    jsonKV(j, "ivlMs", (long)n.ivlMs);
+    jsonKV(j, "rssi", (long)n.rssi); jsonKV(j, "rssiMin", (long)n.rssiMin); jsonKV(j, "rssiMax", (long)n.rssiMax);
+    jsonKV(j, "mv", (long)lroundf(n.volt * 1000));
+    jsonKV(j, "pid", n.havePid ? (long)n.lastPid : -1L);
+    jsonKV(j, "restarts", (long)n.restarts);
+    jsonKB(j, "conn", n.connectable);
+    jsonKB(j, "air", n.hasAir); jsonKB(j, "lux", n.hasLux); jsonKB(j, "uvOk", n.hasUV);
+    jsonKV(j, "fw", n.fw);
+    jsonKV(j, "st", n.st);
+    jsonKB(j, "upd", n.updating);
+    jsonKV(j, "pct", (long)n.pct);
+    jsonKV(j, "fails", (long)n.fails);
+    jsonKB(j, "small", n.smallPkts);
+    jsonKV(j, "nextS", n.nextCheckAt ? (long)((int32_t)(n.nextCheckAt - now) / 1000) : 0L);
+    jsonKV(j, "checks", (long)n.checks);
+    jsonKV(j, "checkS", ageS(now, n.lastCheckAt));
+    jsonKV(j, "diag", n.diag);
+    jsonKV(j, "diagS", ageS(now, n.diagAt));
+    jsonEnd(j, '}'); j += ',';
+  }
+  jsonEnd(j, ']'); j += ',';
+  j += "\"probes\":[";
+  for (int k = 0; k < MAX_SENSORS; k++) {
+    Sensor &p = sensors[k];
+    if (!p.used) continue;
+    j += '{';
+    jsonKV(j, "name", p.name);
+    jsonKV(j, "node", nodes[p.node].mac);
+    jsonKV(j, "kind", kindOf(p));
+    jsonKV(j, "raw", (long)p.raw);
+    jsonKV(j, "pct", (long)pctOf(p, p.raw));
+    jsonKV(j, "dry", (long)p.dry); jsonKV(j, "wet", (long)p.wet);
+    jsonKB(j, "fcal", p.fcal);
+    jsonKV(j, "qS", ageS(now, p.lastQAt));
+    jsonEnd(j, '}'); j += ',';
+  }
+  jsonEnd(j, ']'); j += ',';
+  xSemaphoreGive(lock);
+  j += "\"log\":[";
+  xSemaphoreTake(logLock, portMAX_DELAY);
+  for (int k = 0; k < logCount; k++) {               // newest first
+    const LogEnt &e = logBuf[(logHead - 1 - k + LOG_LEN) % LOG_LEN];
+    j += '{'; jsonKV(j, "ageS", ageS(now, e.ms)); jsonKV(j, "epoch", (long)e.epoch); jsonKV(j, "t", e.t); jsonEnd(j, '}'); j += ',';
+  }
+  xSemaphoreGive(logLock);
+  jsonEnd(j, ']');
+  j += '}';
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
+}
+
 // ---------------- setup / loop ----------------
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.printf("\nGROUNDWELL hub %s starting (slot %s)\n", FW_VERSION, slotName());
+  logLock = xSemaphoreCreateMutex();
+  logEvent("Hub %s started from slot %s (last reset: %s)", FW_VERSION, slotName(), espResetText(esp_reset_reason()));
   lock = xSemaphoreCreateMutex();
   prefs.begin("groundwell", false);
   trialCheckAtBoot();                              // may switch back to the previous firmware and restart
@@ -1357,6 +1635,9 @@ void setup() {
   server.on("/api/admin", HTTP_POST, handleAdmin);
   server.on("/setup", HTTP_GET, handleSetupGet);
   server.on("/setup", HTTP_POST, handleSetupSave);
+  server.on("/diag", HTTP_GET, handleDiagPage);
+  server.on("/api/diag", HTTP_GET, handleDiagApi);
+  server.on("/api/diag/check", HTTP_POST, handleDiagCheck);
   server.on("/update", HTTP_GET, handleUpdatePage);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.onNotFound([]() {
@@ -1383,8 +1664,12 @@ void loop() {
 
   bool connected = WiFi.status() == WL_CONNECTED;
   if (connected && !wasConnected) {
-    Serial.printf("Wi-Fi up. Dashboard: http://%s/  (http://%s.local/)\n", WiFi.localIP().toString().c_str(), HOSTNAME);
+    logEvent("Wi-Fi up: %s, %s, channel %d, %d dBm, access point %s", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(),
+             (int)WiFi.channel(), (int)WiFi.RSSI(), WiFi.BSSIDstr().c_str());
+    Serial.printf("Dashboard: http://%s/  (http://%s.local/)\n", WiFi.localIP().toString().c_str(), HOSTNAME);
     everConnected = true;
+    wifiUps++;
+    wifiDownAt = 0;
     startArduinoOta();
     if (mdnsUp) MDNS.end();                          // re-announce on the (possibly new) network address
     mdnsUp = MDNS.begin(HOSTNAME);
@@ -1392,8 +1677,23 @@ void loop() {
     if (mdnsUp && arduinoOtaUp) MDNS.enableArduino(3232, true);   // shows up as a network port in Arduino IDE
     wifiRebootMark = 0;
   }
+  if (!connected && wasConnected) { wifiDownAt = now | 1; logEvent("Wi-Fi down"); }
   wasConnected = connected;
   if (arduinoOtaUp && connected) ArduinoOTA.handle();
+
+  // Online/offline events per node (not while the scan is paused for a node job or an update)
+  static uint32_t lastOnlineCheck = 0;
+  if (now - lastOnlineCheck >= 1000 && !jobBusy && !otaBusy) {
+    lastOnlineCheck = now;
+    char went[MAX_NODES][18]; bool up[MAX_NODES]; int nw = 0;
+    xSemaphoreTake(lock, portMAX_DELAY);
+    for (int i = 0; i < MAX_NODES; i++) if (nodes[i].used && nodes[i].firstSeen) {
+      bool on = now - nodes[i].lastSeen < STALE_MS;
+      if (on != nodes[i].online) { nodes[i].online = on; strlcpy(went[nw], nodes[i].mac, 18); up[nw++] = on; }
+    }
+    xSemaphoreGive(lock);
+    for (int k = 0; k < nw; k++) logEvent(up[k] ? "Node %s online" : "Node %s offline (nothing heard for %lu s)", went[k], (unsigned long)(STALE_MS / 1000));
+  }
   trialMaybeConfirm();
   nodeUpdaterLoop();
 
