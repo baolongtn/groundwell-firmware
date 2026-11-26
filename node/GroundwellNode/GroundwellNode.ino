@@ -1,5 +1,6 @@
 /*
-  GROUNDWELL sensor node v0.12.0  (capacitive soil probe + air temperature/humidity + light + UV, one board)
+  GROUNDWELL sensor node v0.13.0  (capacitive soil probe + air temperature/humidity + light + UV, one board;
+                                   on the EVT1 board, soil EC and soil temperature too)
   Board:  Seeed XIAO nRF52840 (plain or Sense)
           Arduino IDE: Boards Manager URL
             https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
@@ -19,6 +20,27 @@
     Serial command UNLINK forgets the link key.
   v0.12: the rod probe is gone (the capacitive probe is the soil sensor), so the packet is 3 bytes shorter and
   pins D2, D3 and D4 are free.
+  v0.13: builds for the GROUNDWELL EVT1 circuit board too (set GW_BOARD to BOARD_EVT1). It adds soil
+  conductivity (EC) and soil temperature, which the cloud turns into a "feed level". Nothing changes on the
+  breadboard build.
+
+  EVT1 board (GW_BOARD = BOARD_EVT1)
+    One PCB: XIAO nRF52840 Plus, CR2032, SHT40 + LTR-390 on I2C (D4/D5), and a stake with three sensors:
+      moisture electrode  D3 drives a 2 MHz square wave through 10k; a peak detector on A2 reads it
+                          (same 0..4095 scale and CAL AIR / CAL WATER as the v2.0 probe; LOWER = wetter)
+      EC pads             two gold pads, driven alternately from D7 and D6 through a 10k reference and
+                          two 1k resistors, read on A0. Equal time each way, so the pads never plate or drift.
+      soil NTC            10k B3380 at the tip, powered from D8 through 10k, read on A1
+      button              D9 to GND: FAST readings for 5 minutes
+    Odd readings carry soil EC (BTHome 0x56, uS/cm, bulk soil at the soil's own temperature) and soil
+    temperature (0x58, 0.35 C steps) in place of the UV index; even readings carry UV. Both fit 26 bytes.
+    The cloud corrects EC to 25 C and for moisture; the node sends what it measures.
+    EC calibration, over USB serial, once per board:
+      CAL EC <uS/cm>       stake in a conductivity standard up to the soil line (1413 uS/cm KCl is the usual
+                           one): measures the pads' cell constant and saves it to flash
+      CAL EC CLEAR         back to the default cell constant (1.0 /cm)
+    EVT1 builds report their version as "0.13.0-evt1", and the hub never updates a node built for another
+    board with its own bundled firmware: flash EVT1 boards over USB or from nRF Connect.
   Diagnostics (v0.11): a read-only characteristic reports uptime, why it last restarted, readings sent,
   air-sensor read failures, sensors, calibration, link, update window, radio power, interval, connections
   and failed link-key attempts. The hub reads it at each check and shows it on http://plants.local/diag.
@@ -108,13 +130,25 @@
       I2C sensors  (LIGHT_I2C) SDA -> A4, SCL -> A5
 */
 
-static const char *FW_VERSION = "0.12.0";
+static const char *FW_VERSION = "0.13.0";      // EVT1 builds report "0.13.0-evt1" (see fwText)
+
+// ---------------- board choice (v0.13) ----------------
+#define BOARD_PROTO    1                         // XIAO with a v2.0 capacitive probe and breakout sensors (wiring above)
+#define BOARD_EVT1     2                         // GROUNDWELL EVT1 circuit board (see "EVT1 board" in the header)
+#ifndef GW_BOARD
+#define GW_BOARD       BOARD_PROTO               // <-- change to BOARD_EVT1 for the EVT1 board (CI: -DGW_BOARD=BOARD_EVT1)
+#endif
+#define GW_EVT1 (GW_BOARD == BOARD_EVT1)
 
 // ---------------- light sensor choice ----------------
 #define LIGHT_LDR      1                         // GL5539 photoresistor + DHT11, no I2C (the parts in hand)
 #define LIGHT_I2C      2                         // I2C sensors on D4/D5: SHT4x / AHT20 / VEML7700 / LTR390
 #define LIGHT_VEML7700 LIGHT_I2C                 // older name for the same wiring
 #define LIGHT_SENSOR   LIGHT_LDR                 // <-- change to LIGHT_I2C when you fit I2C sensors
+#if GW_EVT1
+#undef LIGHT_SENSOR
+#define LIGHT_SENSOR   LIGHT_I2C                 // EVT1 always has the SHT40 and LTR-390 on D4/D5
+#endif
 
 // ---------------- board ----------------
 #if defined(ARDUINO_ARCH_NRF52)
@@ -128,6 +162,9 @@ static const char *FW_VERSION = "0.12.0";
 #endif
 #else
 #error "GroundwellNode builds for the Seeed XIAO nRF52840, or as a test node for the Arduino Nano ESP32"
+#endif
+#if GW_EVT1 && !GW_NRF52
+#error "The EVT1 board carries a XIAO nRF52840: build it for that board"
 #endif
 
 #if GW_NRF52
@@ -174,16 +211,58 @@ static const uint16_t LDR_SETTLE_MS   = 5;
 
 // Factory calibration limits for the capacitive probe (raw counts, 12-bit, ratiometric to VDD).
 // A unit outside these fails calibration: wrong timer chip, damaged coating, probe not in water, and so on.
+#if GW_EVT1
+// EVT1 electrode: wider limits until EVT1 boards give real numbers (the peak detector is new; tune and tighten).
+static const uint16_t CAL_AIR_MIN   = 1800, CAL_AIR_MAX   = 4000;
+static const uint16_t CAL_WATER_MIN = 200,  CAL_WATER_MAX = 3200;
+static const uint16_t CAL_SPAN_MIN  = 400;   // air minus water
+#else
 static const uint16_t CAL_AIR_MIN   = 2400, CAL_AIR_MAX   = 3900;
 static const uint16_t CAL_WATER_MIN = 300,  CAL_WATER_MAX = 2600;
 static const uint16_t CAL_SPAN_MIN  = 700;   // air minus water
+#endif
 static const float    CAL_SD_MAX    = 15.0f; // counts; a probe still moving or settling fails
 static const uint8_t  CAL_SAMPLES   = 20;    // 20 readings ...
 static const uint16_t CAL_GAP_MS    = 500;   // ... 0.5 s apart = 10 s
 static const char    *CAL_FILE      = "/gwcal.bin";
 
+#if GW_EVT1
+// EVT1 soil sensing (v0.13). Values from the EVT1 schematic; see "EVT1 board" in the header.
+static const uint8_t  MOIST_PWM_TOP   = 8;       // 16 MHz / 8 = 2 MHz square wave into the moisture electrode
+static const uint16_t MOIST_SETTLE_MS = 5;       // the peak detector (1 nF, 1 MOhm bleed) settles in about 1 ms
+static const float    EC_R_REF        = 10000.0f;// R6, from EC_DRV_A to the sense node
+static const float    EC_R_SERIES     = 2000.0f; // R7 + R8, 1 kOhm in series with each pad
+static const uint8_t  EC_FLIPS        = 32;      // polarity flips per reading (equal time each way: no net DC)
+static const uint16_t EC_SETTLE_US    = 20;      // after each flip, before the sample
+static const float    EC_K_DEFAULT    = 1.0f;    // cell constant, 1/cm, until CAL EC measures this board's pads
+static const float    EC_K_MIN = 0.05f, EC_K_MAX = 20.0f;
+static const float    EC_ALPHA        = 0.02f;   // conductivity rises about 2% per C (KCl standards and soil water)
+static const char    *EC_FILE         = "/gwec.bin";
+static const float    NTC_R_TOP       = 10000.0f;// R5, from NTC_PWR to the sense node
+static const float    NTC_R25         = 10000.0f;// NCP15XH103F03RC: 10 kOhm at 25 C ...
+static const float    NTC_BETA        = 3380.0f; // ... B(25/50) = 3380 K
+static const uint16_t NTC_SETTLE_MS   = 10;      // 10k into the 100 nF filter: 1 ms time constant
+static const uint16_t BUTTON_DEBOUNCE_MS = 300;
+#endif
+
 // ---------------- pins ----------------
-#if GW_NRF52
+#if GW_EVT1
+// EVT1 pin map: D0 EC_SENSE, D1 NTC_SENSE, D2 MOIST_ADC, D3 MOIST_DRV, D4 SDA, D5 SCL,
+//               D6 EC_DRV_B, D7 EC_DRV_A, D8 NTC_PWR, D9 BTN, D10 spare.
+static const int PIN_EC_SENSE  = A0;   // D0
+static const int PIN_NTC_SENSE = A1;   // D1
+static const int PIN_MOIST_ADC = A2;   // D2
+static const int PIN_MOIST_DRV = D3;
+static const int PIN_EC_DRV_B  = D6;
+static const int PIN_EC_DRV_A  = D7;
+static const int PIN_NTC_POWER = D8;
+static const int PIN_BUTTON    = D9;
+static const int PIN_CAP_AOUT  = A2;   // the shared capacitive code reads through readElectrode() on EVT1
+static const int PIN_CAP_POWER = D3;
+static const int PIN_DHT       = D10;  // no DHT11 on EVT1: D10 is the spare pad, so the fallback read just fails
+__attribute__((unused)) static const char *I2C_PINS = "D4/D5";
+#define OUTPUT_STRONG OUTPUT_H0H1
+#elif GW_NRF52
 static const int PIN_CAP_AOUT  = A0;   // D0
 static const int PIN_CAP_POWER = D1;
 static const int PIN_DHT       = D6;
@@ -240,8 +319,20 @@ static SemaphoreHandle_t wakeSem;                    // lets a Bluetooth event w
 // Diagnostics (v0.11)
 static uint32_t readings = 0, airFails = 0, connects = 0, authFails = 0;
 static uint32_t fastUntil = 0;                        // FAST command: 5 s readings until this millis()
+static char fwText[24];                               // FW_VERSION plus the board ("0.13.0-evt1"), as the hub sees it
 // Declared here, before any function: the Arduino IDE puts a prototype of every function above the first one.
 struct AirFilter { bool have, pend; float t, h, pt, ph; };
+#if GW_EVT1
+struct EcCal { uint32_t magic; float k; uint32_t check; };   // EC cell constant from CAL EC, in flash
+static const uint32_t EC_MAGIC = 0x31434547;         // "GEC1"
+static float ecK = EC_K_DEFAULT;
+static bool ecCalOk = false;
+static volatile bool buttonHit = false;
+static uint32_t buttonAt = 0;
+static uint16_t lastEcUs = 0;                         // last soil reading, for INFO and the serial log
+static float lastSoilC = 0;
+static bool lastEcOk = false, lastSoilOk = false;
+#endif
 
 // ---------------- measurements ----------------
 // One ADC sample as 0..4095 of the supply rail, the scale every reading below is written for.
@@ -256,6 +347,9 @@ static uint16_t adcRead(int pin) {
 #endif
 }
 
+#if GW_EVT1
+static uint16_t readElectrode();                     // EVT1 moisture electrode, defined with the soil readings below
+#endif
 static uint16_t avgRead(int pin, uint8_t n) {
   adcRead(pin);                                      // discard the first sample after switching
   uint32_t acc = 0;
@@ -264,12 +358,17 @@ static uint16_t avgRead(int pin, uint8_t n) {
 }
 
 // Capacitive probe: power it, let the 555 + filter settle, read, power off.
+// EVT1 board: its moisture electrode instead, on the same scale (LOWER = wetter), so calibration is unchanged.
 static uint16_t readCapacitive() {
+#if GW_EVT1
+  return readElectrode();
+#else
   digitalWrite(PIN_CAP_POWER, HIGH);
   delay(CAP_SETTLE_MS);
   uint16_t v = avgRead(PIN_CAP_AOUT, OVERSAMPLE);
   digitalWrite(PIN_CAP_POWER, LOW);
   return v;                                          // 0..4095 of VDD (ratiometric)
+#endif
 }
 
 // Supply voltage through the SAADC's internal VDD channel (no divider, no leakage).
@@ -370,6 +469,43 @@ static bool airFilter(AirFilter &f, float t, float h) {
   return false;
 }
 // ---- end sensor math ----
+
+#if GW_EVT1
+// ---- soil math (host-tested: tools/soil_math_test.cpp) ----
+// EC divider: EC_DRV_A (D7) -> R6 10k -> EC_SENSE (A0) -> R8 1k -> pad A ~ soil ~ pad B -> R7 1k -> EC_DRV_B (D6).
+// With D7 high and D6 low the sense node reads Rx / (Rref + Rx); flipped, it reads Rref / (Rref + Rx),
+// where Rx is the soil plus the two 1k resistors. a and b are the mean counts (0..4095 of VDD) in each direction.
+// Returns the soil's resistance in ohms, or a negative number for an open circuit (dry soil, stake out of the pot).
+static float ecSoilOhms(float a, float b) {
+  float sum = 0; int n = 0;
+  if (a < 4090.0f && a > 0.5f) { sum += EC_R_REF * a / (4095.0f - a); n++; }
+  if (b > 5.0f && b < 4094.5f) { sum += EC_R_REF * (4095.0f - b) / b; n++; }
+  if (!n) return -1.0f;
+  float r = sum / n - EC_R_SERIES;
+  return r < 1.0f ? 1.0f : r;
+}
+// Bulk soil conductivity at the soil's own temperature, uS/cm: cell constant (1/cm) over the resistance.
+static uint16_t ecMicroSiemens(float ohms, float k) {
+  if (ohms <= 0) return 0;                           // open circuit: nothing conducts
+  float us = k * 1.0e6f / ohms;
+  return (uint16_t)(us > 65535.0f ? 65535 : lroundf(us));
+}
+// Soil NTC: NTC_PWR (D8) -> R5 10k -> NTC_SENSE (A1) -> NTC -> GND. Beta equation, 25 C reference.
+// Returns false for a reading off either end (NTC open or shorted).
+static bool ntcCelsius(float counts, float &tC) {
+  if (counts < 40.0f || counts > 4055.0f) return false;
+  float r = NTC_R_TOP * counts / (4095.0f - counts);
+  tC = 1.0f / (1.0f / 298.15f + logf(r / NTC_R25) / NTC_BETA) - 273.15f;
+  return tC > -40.0f && tC < 85.0f;
+}
+// CAL EC: the cell constant that makes this resistance read a standard solution's conductivity.
+// refUs25 is the standard's value at 25 C (1413 uS/cm for 0.01 M KCl); it reads higher when warmer.
+static float ecCellConstant(float ohms, float refUs25, float tC) {
+  float refT = refUs25 * (1.0f + EC_ALPHA * (tC - 25.0f));
+  return refT * ohms / 1.0e6f;
+}
+// ---- end soil math ----
+#endif
 
 #if LIGHT_SENSOR == LIGHT_I2C
 // ---------------- I2C sensors ----------------
@@ -576,6 +712,90 @@ static bool storeWrite(const char *path, const void *buf, size_t n) { return pre
 static void storeRemove(const char *path) { if (prefs.isKey(prefKey(path))) prefs.remove(prefKey(path)); }
 #endif
 
+#if GW_EVT1
+// ---------------- EVT1 soil readings ----------------
+// Moisture electrode: a 2 MHz square wave from D3 through R1 (10k) into the electrode, with a 1N4148 / 1 nF / 1M
+// peak detector on A2 (after b-parasite). Wetter soil adds capacitance and shrinks the wave, so the count falls
+// as the soil gets wetter, like the v2.0 probe. The PWM peripheral runs only for the few ms of the reading.
+static uint16_t readElectrode() {
+  HardwarePWM &pwm = HwPWM3;                         // PWM0..2 are left for analogWrite() and tone()
+  pwm.setClockDiv(PWM_PRESCALER_PRESCALER_DIV_1);    // 16 MHz
+  pwm.setMaxValue(MOIST_PWM_TOP);
+  pwm.addPin(PIN_MOIST_DRV);
+  pwm.writePin(PIN_MOIST_DRV, MOIST_PWM_TOP / 2);    // 50% duty
+  delay(MOIST_SETTLE_MS);
+  uint16_t v = avgRead(PIN_MOIST_ADC, OVERSAMPLE);
+  pwm.removePin(PIN_MOIST_DRV);
+  pwm.stop();
+  pinMode(PIN_MOIST_DRV, OUTPUT);
+  digitalWrite(PIN_MOIST_DRV, LOW);
+  return v;                                          // 0..4095 of VDD
+}
+
+// EC pads: drive one way, sample, flip, sample, EC_FLIPS times, so the pads see no net DC (no plating, no drift).
+// Both drive pins end low: no current flows between readings.
+static float readSoilOhms() {
+  uint32_t sa = 0, sb = 0;
+  adcRead(PIN_EC_SENSE);                             // connect the ADC to the sense pin first
+  for (uint8_t i = 0; i < EC_FLIPS; i++) {
+    digitalWrite(PIN_EC_DRV_B, LOW);  digitalWrite(PIN_EC_DRV_A, HIGH);
+    delayMicroseconds(EC_SETTLE_US);
+    sa += adcRead(PIN_EC_SENSE);
+    digitalWrite(PIN_EC_DRV_A, LOW);  digitalWrite(PIN_EC_DRV_B, HIGH);
+    delayMicroseconds(EC_SETTLE_US);
+    sb += adcRead(PIN_EC_SENSE);
+  }
+  digitalWrite(PIN_EC_DRV_B, LOW);
+  return ecSoilOhms((float)sa / EC_FLIPS, (float)sb / EC_FLIPS);
+}
+
+static bool readSoilTemp(float &tC) {
+  digitalWrite(PIN_NTC_POWER, HIGH);
+  delay(NTC_SETTLE_MS);
+  uint16_t c = avgRead(PIN_NTC_SENSE, OVERSAMPLE);
+  digitalWrite(PIN_NTC_POWER, LOW);
+  return ntcCelsius(c, tC);
+}
+
+static uint32_t ecCheck(const EcCal &c) { uint32_t u; memcpy(&u, &c.k, 4); return u ^ 0x5A5AA5A5u; }
+static void loadEcCal() {
+  EcCal c;
+  ecCalOk = storeRead(EC_FILE, &c, sizeof c) && c.magic == EC_MAGIC && c.check == ecCheck(c) && c.k >= EC_K_MIN && c.k <= EC_K_MAX;
+  ecK = ecCalOk ? c.k : EC_K_DEFAULT;
+}
+// CAL EC <uS/cm>: stake in a conductivity standard up to the soil line (1413 uS/cm at 25 C is the usual one).
+static void calEc(unsigned refUs) {
+  if (refUs < 100 || refUs > 20000) { Serial.println("CAL EC FAIL reason=standard_out_of_range (100 to 20000 uS/cm)"); return; }
+  float ohms = 0, tSum = 0;
+  uint8_t tN = 0;
+  for (uint8_t i = 0; i < 8; i++) {                  // 8 readings over about 2 s
+    float r = readSoilOhms(), t;
+    if (r <= 0) { Serial.println("CAL EC FAIL reason=open_circuit (are the pads in the solution?)"); return; }
+    ohms += r / 8;
+    if (readSoilTemp(t)) { tSum += t; tN++; }
+    delay(250);
+  }
+  bool tOk = tN > 0;
+  float tC = tOk ? tSum / tN : 25.0f;
+  if (!tOk) Serial.println("CAL EC note: soil temperature failed, assuming 25 C");
+  float k = ecCellConstant(ohms, (float)refUs, tC);
+  if (k < EC_K_MIN || k > EC_K_MAX) { Serial.printf("CAL EC FAIL reason=cell_constant_out_of_range k=%.3f ohms=%.0f\n", k, ohms); return; }
+  EcCal c = {EC_MAGIC, k, 0};
+  c.check = ecCheck(c);
+  if (!storeWrite(EC_FILE, &c, sizeof c)) { Serial.println("CAL EC FAIL reason=flash_write"); return; }
+  loadEcCal();
+  Serial.printf("CAL EC PASS k=%.4f ohms=%.0f temp=%.1f standard=%u saved\n", ecK, ohms, tC, refUs);
+}
+
+// PAIR/CAL button (D9 to GND): a press gives FAST readings for 5 minutes, handy while setting a pot up.
+static void buttonIsr() {
+  buttonHit = true;
+  BaseType_t woken = pdFALSE;
+  xSemaphoreGiveFromISR(wakeSem, &woken);
+  portYIELD_FROM_ISR(woken);
+}
+#endif
+
 // ---------------- factory calibration ----------------
 static uint16_t calCheck(const CalData &c) { return (uint16_t)(c.air ^ c.water ^ c.version ^ 0xA5A5u); }
 
@@ -655,7 +875,12 @@ static void addrText(char *out) {
 static void printInfo() {
   char mac[18];
   addrText(mac);
-  Serial.printf("INFO fw=%s mac=%s interval_ms=%lu light=%s ", FW_VERSION, mac, (unsigned long)REPORT_MS, lightName());
+  Serial.printf("INFO fw=%s mac=%s interval_ms=%lu light=%s ", fwText, mac, (unsigned long)REPORT_MS, lightName());
+#if GW_EVT1
+  Serial.printf("board=evt1 eccal=%s k=%.4f ", ecCalOk ? "yes" : "no", ecK);
+  if (lastEcOk) Serial.printf("ec_us=%u ", lastEcUs);
+  if (lastSoilOk) Serial.printf("soil_c=%.1f ", lastSoilC);
+#endif
 #if LIGHT_SENSOR == LIGHT_I2C
   Serial.printf("air=%s uv=%s ", airSrc, ltrOk ? "ltr390" : "none");
 #else
@@ -674,6 +899,10 @@ static void handleCommand(char *line) {
   else if (!strcmp(line, "CAL WATER")) { if (measurePoint("WATER", pendWater)) { if (pendAir) finishCal(pendAir, pendWater); } else pendWater = 0; }
   else if (sscanf(line, "CAL SET %u %u", &a, &w) == 2) finishCal((uint16_t)a, (uint16_t)w);
   else if (!strcmp(line, "CAL CLEAR")) { storeRemove(CAL_FILE); calOk = false; pendAir = pendWater = 0; Serial.println("CAL CLEARED OK"); }
+#if GW_EVT1
+  else if (!strcmp(line, "CAL EC CLEAR")) { storeRemove(EC_FILE); loadEcCal(); Serial.printf("CAL EC CLEARED k=%.4f OK\n", ecK); }
+  else if (sscanf(line, "CAL EC %u", &a) == 1) calEc(a);
+#endif
 #if GW_NRF52
   else if (!strcmp(line, "UNLINK"))    { storeRemove(KEY_FILE); keyOk = false; updateInfo(); Serial.println("UNLINKED OK"); }
 #else
@@ -733,6 +962,18 @@ static uint8_t buildBTHome(uint8_t *b, uint8_t pid, bool airOk, float tempC, flo
     b[n++] = 0x46; b[n++] = (uint8_t)(u <= 0 ? 0 : u >= 255.0f ? 255 : lroundf(u));
   }
   return n;                                          // 23 bytes with air + light + UV (the legacy advert allows 26), 11 with none
+}
+// EVT1 soil block (v0.13), added after buildBTHome's objects so the IDs still ascend:
+//         | [56 conductivity uS/cm (u16)] | [58 soil temperature (s8, 0.35 C steps)]
+// The conductivity is the bulk soil reading at the soil's own temperature: the cloud corrects it to 25 C and for
+// moisture. It goes out on alternate readings in place of the UV index, so a full packet is still 26 bytes.
+__attribute__((unused)) static uint8_t appendSoil(uint8_t *b, uint8_t n, bool ecOk, uint16_t ecUs, bool soilOk, float soilC) {
+  if (ecOk) { b[n++] = 0x56; b[n++] = (uint8_t)(ecUs & 0xFF); b[n++] = (uint8_t)(ecUs >> 8); }
+  if (soilOk) {
+    long t = lroundf(soilC / 0.35f);
+    b[n++] = 0x58; b[n++] = (uint8_t)(int8_t)(t < -128 ? -128 : t > 127 ? 127 : t);
+  }
+  return n;
 }
 // ---- end BTHome packet (host-tested: tools/bthome_roundtrip_test.cpp) ----
 
@@ -807,12 +1048,16 @@ static void updateDiag() {
            (unsigned long)(millis() / 1000), resetReasonText(), (unsigned long)readings, airSrc, (unsigned long)airFails, lightName(),
            calOk ? 1 : 0, keyOk ? 1 : 0, (unsigned long)winLeft, (int)TX_POWER_DBM,
            (unsigned long)((fast ? FAST_REPORT_MS : REPORT_MS) / 1000), (unsigned long)connects, (unsigned long)authFails);
+#if GW_EVT1
+  size_t used = strlen(b);
+  snprintf(b + used, sizeof b - used, ";brd=evt1;ecc=%d", ecCalOk ? 1 : 0);
+#endif
   gwDiag.write(b);
 }
 
 static void updateInfo() {
   char b[40];
-  snprintf(b, sizeof b, "%s;l=%d;w=%d;v=%.2f", FW_VERSION, keyOk ? 1 : 0, dfuWindowOpen() ? 1 : 0, lastVdd);
+  snprintf(b, sizeof b, "%s;l=%d;w=%d;v=%.2f", fwText, keyOk ? 1 : 0, dfuWindowOpen() ? 1 : 0, lastVdd);
   gwInfo.write(b);
 }
 
@@ -1015,16 +1260,26 @@ static void serviceBurst() {
 
 void setup() {
   Serial.begin(115200);
+  snprintf(fwText, sizeof fwText, "%s%s", FW_VERSION, GW_EVT1 ? "-evt1" : "");
 
   pinMode(LED_RED, OUTPUT);   digitalWrite(LED_RED, HIGH);    // LEDs are active-low: off
   pinMode(LED_GREEN, OUTPUT); digitalWrite(LED_GREEN, HIGH);
   pinMode(LED_BLUE, OUTPUT);  digitalWrite(LED_BLUE, HIGH);
 
-  pinMode(PIN_CAP_POWER, OUTPUT_STRONG);             // the probe pulls a few mA
+  pinMode(PIN_CAP_POWER, OUTPUT_STRONG);             // the probe pulls a few mA (EVT1: the electrode drive, D3)
   digitalWrite(PIN_CAP_POWER, LOW);
+#if GW_EVT1
+  pinMode(PIN_EC_DRV_A, OUTPUT);  digitalWrite(PIN_EC_DRV_A, LOW);   // both low: no current through the pads
+  pinMode(PIN_EC_DRV_B, OUTPUT);  digitalWrite(PIN_EC_DRV_B, LOW);
+  pinMode(PIN_NTC_POWER, OUTPUT); digitalWrite(PIN_NTC_POWER, LOW);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+#endif
   dht.begin();
   storeBegin();
   loadCal();
+#if GW_EVT1
+  loadEcCal();
+#endif
 #if LIGHT_SENSOR == LIGHT_I2C
   Wire.begin();
   shtOk  = sht4xBegin();
@@ -1048,11 +1303,14 @@ void setup() {
   Bluefruit.setTxPower(TX_POWER_DBM);
   Bluefruit.setName("GW");
   wakeSem = xSemaphoreCreateBinary();
+#if GW_EVT1
+  attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), buttonIsr, FALLING);
+#endif
   loadKey();
   beginLinkServices();
   bledis.setManufacturer("GROUNDWELL");
   bledis.setModel("Sensor node");
-  bledis.setSoftwareRev(FW_VERSION);                 // firmware revision stays the bootloader's (update apps read it)
+  bledis.setSoftwareRev(fwText);                 // firmware revision stays the bootloader's (update apps read it)
   bledis.begin();
 #else
   analogReadResolution(12);
@@ -1063,7 +1321,7 @@ void setup() {
 
   char mac[18];
   addrText(mac);
-  Serial.printf("GROUNDWELL node fw %s  address %s\n", FW_VERSION, mac);
+  Serial.printf("GROUNDWELL node fw %s  address %s\n", fwText, mac);
 #if GW_NRF52
   Serial.printf("Hub link: %s\n", keyOk ? "linked" : "not linked yet (a hub links it within 10 minutes of a reset)");
   if (DFU_WINDOW_MS) Serial.printf("Bluetooth updates open for %lu min: nRF Connect > \"GW\" > DFU\n", (unsigned long)(DFU_WINDOW_MS / 60000));
@@ -1072,6 +1330,10 @@ void setup() {
 #endif
   if (calOk) Serial.printf("Factory calibration: air %u, water %u (sending moisture %%)\n", cal.air, cal.water);
   else       Serial.println("No factory calibration yet (sending the raw capacitive count). Send CAL AIR, then CAL WATER.");
+#if GW_EVT1
+  if (ecCalOk) Serial.printf("EVT1 board: EC cell constant %.4f /cm (from CAL EC)\n", ecK);
+  else         Serial.printf("EVT1 board: EC not calibrated, using %.2f /cm. Stake in 1413 uS/cm standard, then CAL EC 1413.\n", ecK);
+#endif
 }
 
 void loop() {
@@ -1089,12 +1351,29 @@ void loop() {
   bool airOk    = airRead && airFilter(airF, tempC, rh);
   float lux = 0;
   bool luxOk    = readLight(lux);
+  uint8_t pid   = ++packetId;
+#if GW_EVT1
+  bool soilTurn = pid & 1;                           // EVT1: soil EC + temperature on odd readings, UV on even ones
+#else
+  bool soilTurn = false;
+#endif
   float uvi = 0;
-  bool uvOk     = readUV(uvi);
+  bool uvOk     = !soilTurn && readUV(uvi);
   int32_t capPct = calOk ? (int32_t)probeScaleX100(cap) : -1;
 
   uint8_t svc[31];
-  uint8_t len = buildBTHome(svc, ++packetId, airOk, tempC, rh, luxOk, lux, vdd, capPct, cap, uvOk, uvi);
+  uint8_t len = buildBTHome(svc, pid, airOk, tempC, rh, luxOk, lux, vdd, capPct, cap, uvOk, uvi);
+#if GW_EVT1
+  if (soilTurn) {
+    float ohms = readSoilOhms(), soilC = 0;
+    bool soilOk = readSoilTemp(soilC);
+    lastEcUs = ecMicroSiemens(ohms, ecK);
+    lastEcOk = true;                                 // an open circuit reads 0 uS/cm: dry soil, or the stake is out
+    lastSoilOk = soilOk;
+    if (soilOk) lastSoilC = soilC;
+    len = appendSoil(svc, len, true, lastEcUs, soilOk, soilC);
+  }
+#endif
   advertise(svc, len);
   uint32_t now = millis(), dt = lastSentAt ? now - lastSentAt : 0;
   lastSentAt = now;
@@ -1112,7 +1391,13 @@ void loop() {
 #endif
   if (capPct >= 0) snprintf(capTxt, sizeof capTxt, "capacitive %4u = %5.1f%%", cap, capPct / 100.0f);
   else             snprintf(capTxt, sizeof capTxt, "capacitive %4u (uncal)", cap);
+#if GW_EVT1
+  char soilTxt[48] = "";
+  if (soilTurn) snprintf(soilTxt, sizeof soilTxt, lastSoilOk ? "  soil %u uS/cm %.1f C" : "  soil %u uS/cm", lastEcUs, lastSoilC);
+  Serial.printf("#%u dt=%lums  %s  %s  %s  VDD %.2f V%s\n", packetId, (unsigned long)dt, capTxt, airTxt, luxTxt, vdd, soilTxt);
+#else
   Serial.printf("#%u dt=%lums  %s  %s  %s  VDD %.2f V\n", packetId, (unsigned long)dt, capTxt, airTxt, luxTxt, vdd);
+#endif
 
   // Absolute schedule: the next reading is due REPORT_MS after the last one was due, however long this
   // one took. The wait is a loop on the clock, so it can't end early, and it answers serial commands.
@@ -1121,6 +1406,18 @@ void loop() {
   if ((int32_t)(millis() - nextAt) >= 0) nextAt = millis() + every;       // fell behind (a 10 s calibration, say)
   while ((int32_t)(nextAt - millis()) > 0) {
     serviceSerial();
+#if GW_EVT1
+    if (buttonHit) {
+      buttonHit = false;
+      if (millis() - buttonAt > BUTTON_DEBOUNCE_MS) {
+        buttonAt = millis();
+        fastUntil = millis() + FAST_FOR_MS;
+        nextAt = millis();                           // read now, then every 5 s
+        Serial.println("Button: FAST readings for 5 minutes");
+        break;
+      }
+    }
+#endif
 #if GW_NRF52
     serviceLink();
 #else

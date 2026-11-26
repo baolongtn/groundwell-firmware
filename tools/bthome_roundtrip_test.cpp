@@ -52,7 +52,32 @@ int main() {
       CHECK(p.nCounts == 1 && p.counts[0] == c.cap);
     }
   }
+  // v0.13 EVT1: soil EC + soil temperature go in place of the UV index on alternate readings
+  struct Soil { bool ecOk; uint16_t ec; bool tOk; float t; } soils[] = {
+    {true, 1234, true, 21.7f}, {true, 0, false, 0}, {true, 65535, true, -3.5f}, {true, 800, true, 60.0f}, {false, 0, true, 18.2f}};
+  for (auto &c : soils) {
+    uint8_t b[32];
+    uint8_t n = buildBTHome(b, 33, true, 22.0f, 50.0f, true, 120000.0f, 3.0f, 4567, 2283, false, 0);   // everything but UV
+    n = appendSoil(b, n, c.ecOk, c.ec, c.tOk, c.t);
+    CHECK(n <= 26);                                       // the fullest soil packet still fits the legacy advert
+    CHECK(3 + 2 + n <= 31);
+    printf("soil packet:");
+    for (int i = 0; i < n; i++) printf(" %02X", b[i]);
+    printf("\n");
+    BTHomePacket p;
+    CHECK(parseBTHome(b + 2, n - 2, p));
+    CHECK(p.hasMoist && p.hasLux && p.hasTemp && !p.hasUV);
+    CHECK(fabsf(p.tempC - 22.0f) < 0.006f);              // the air temperature stays the air temperature
+    CHECK(p.hasEC == c.ecOk);
+    if (c.ecOk) CHECK(p.ec == c.ec);
+    CHECK(p.hasSoilT == c.tOk);
+    if (c.tOk) CHECK(fabsf(p.soilC - (c.t > 44.45f ? 44.45f : c.t)) <= 0.18f);   // 0.35 C steps, s8 tops out at 44.45 C
+  }
   BTHomePacket q;
+  uint8_t s57[] = {0x40, 0x00, 0x09, 0x56, 0xD2, 0x04, 0x57, 0xEB};   // 1234 uS/cm, -21 C as a whole-degree object
+  CHECK(parseBTHome(s57, sizeof s57, q) && q.hasEC && q.ec == 1234 && q.hasSoilT && fabsf(q.soilC + 21.0f) < 0.01f);
+  uint8_t s45[] = {0x40, 0x00, 0x09, 0x45, 0xD9, 0x00};                // 21.7 C in 0.1 C steps
+  CHECK(parseBTHome(s45, sizeof s45, q) && q.hasSoilT && fabsf(q.soilC - 21.7f) < 0.01f && !q.hasEC);
   uint8_t enc[] = {0x41, 0x00, 0x01};               CHECK(!parseBTHome(enc, sizeof enc, q));   // encrypted
   uint8_t v1[]  = {0x20, 0x00, 0x01};               CHECK(!parseBTHome(v1, sizeof v1, q));     // BTHome v1
   uint8_t cut[] = {0x40, 0x00, 0x05, 0x3D, 0x10};   CHECK(!parseBTHome(cut, sizeof cut, q));   // truncated
