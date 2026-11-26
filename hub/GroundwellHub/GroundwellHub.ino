@@ -132,9 +132,9 @@
   #define GW_CRASH_TEST 0      // 1 = rollback test build: crashes 20 s after every boot (the GitHub build makes one)
 #endif
 #if GW_CRASH_TEST
-  #define GW_FW_VERSION "0.12.1-crashtest"
+  #define GW_FW_VERSION "0.13.0-crashtest"
 #else
-  #define GW_FW_VERSION "0.12.1"
+  #define GW_FW_VERSION "0.13.0"
 #endif
 static const char *FW_VERSION = GW_FW_VERSION;
 // Optional secrets.h (git-ignored): WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY and optionally OTA_PASS.
@@ -190,7 +190,7 @@ static const int      SETUP_BTN_PIN    = BOOT_PIN;           // the BOOT button 
 // ========================================================
 
 // LIVE_LEN: the dashboard plots the last hour, about 120 points at one reading per 30 s; 180 leaves room (v0.12.1, was 720).
-static const int MAX_NODES = 8, MAX_SENSORS = 16, LIVE_LEN = 180, DAY_LEN = 288, QUEUE_LEN = 3000, CLIM_LEN = 600, LIGHT_LEN = 600;
+static const int MAX_NODES = 8, MAX_SENSORS = 16, LIVE_LEN = 180, DAY_LEN = 288, QUEUE_LEN = 3000, CLIM_LEN = 600, LIGHT_LEN = 600, SOIL_LEN = 300;
 static const int H_SLOTS = 12, DT_LEN = 16;               // health window: 12 x 5 min = the last hour; last 16 reading gaps
 static const uint32_t H_SLOT_MS = 5UL * 60 * 1000;
 static const char *KIND[] = {"Capacitive", "Rod", "Probe 3", "Probe 4"};
@@ -208,6 +208,10 @@ struct Node {
   float volt, tempC, rh, lux, uv;
   bool hasAir, hasLux, hasUV;
   uint32_t airAt, climQueuedAt, luxAt, lightQueuedAt, uvAt;
+  uint16_t ec;                   // EVT1 boards (v0.13): bulk soil EC, uS/cm, and soil temperature
+  float soilC;
+  bool hasEC, hasSoilT;
+  uint32_t ecAt, soilQueuedAt;
   uint8_t batt;
   uint32_t lastFreshAt, ivlMs;   // time between new packets (smoothed): should be NODE_INTERVAL_MS
   // node updates (v0.10)
@@ -283,6 +287,14 @@ ClimRec climQ[CLIM_LEN];
 int cHead = 0, cCount = 0;
 LightRec lightQ[LIGHT_LEN];
 int lHead = 0, lCount = 0;
+struct SoilRec {         // one queued soil EC reading for the cloud (EVT1 boards)
+  uint32_t ts;
+  uint8_t node;
+  uint16_t ec;           // uS/cm, at the soil's own temperature
+  int16_t soilX100;      // soil temperature x100, or INT16_MIN when the node didn't send one
+};
+SoilRec soilQ[SOIL_LEN];
+int sHead = 0, sCount = 0;
 uint32_t lastDayPush = 0, lastUpload = 0, lastUploadOk = 0;
 int lastUploadCode = 0;
 uint32_t uploadedTotal = 0;
@@ -498,6 +510,20 @@ static void handlePacket(const char *mac, int rssi, uint8_t addrType, bool conne
       if (p.hasVolt) n.volt = p.volt;
       if (p.hasBatt) n.batt = p.batt;
       if (p.hasUV) { n.uv = p.uv; n.hasUV = true; n.uvAt = millis(); }
+      if (p.hasSoilT) { n.soilC = p.soilC; n.hasSoilT = true; }
+      if (p.hasEC) {
+        n.ec = p.ec;
+        n.hasEC = true;
+        n.ecAt = millis();
+        time_t now = time(nullptr);
+        if (now > 1700000000 && (n.soilQueuedAt == 0 || millis() - n.soilQueuedAt >= CLIMATE_MS)) {
+          int idx = (sHead + sCount) % SOIL_LEN;
+          if (sCount == SOIL_LEN) { sHead = (sHead + 1) % SOIL_LEN; sCount--; }
+          soilQ[idx] = {(uint32_t)now, (uint8_t)ni, p.ec, p.hasSoilT ? (int16_t)lroundf(p.soilC * 100) : (int16_t)INT16_MIN};
+          sCount++;
+          n.soilQueuedAt = millis();
+        }
+      }
       if (p.hasTemp && p.hasHum) {
         n.tempC = p.tempC;
         n.rh = p.humidity;
@@ -606,18 +632,19 @@ static void uploadBatch() {
 
   // Snapshot up to 240 readings plus the sensor names/calibration, then release the lock.
   String body;
-  int n, nc, nl;
+  int n, nc, nl, ns;
   xSemaphoreTake(lock, portMAX_DELAY);
   n = qCount < 240 ? qCount : 240;
   nc = cCount < 100 ? cCount : 100;
   nl = lCount < 100 ? lCount : 100;
-  if (n == 0 && nc == 0 && nl == 0) {
+  ns = sCount < 100 ? sCount : 100;
+  if (n == 0 && nc == 0 && nl == 0 && ns == 0) {
     xSemaphoreGive(lock);
     return;                                           // the device list is emptied every 10 s in loop()
   }
   int nSens = 0;
   for (int i = 0; i < MAX_SENSORS; i++) if (sensors[i].used) nSens++;
-  body.reserve(200 + nSens * 220 + n * 44 + nc * 48 + nl * 40);
+  body.reserve(200 + nSens * 220 + n * 44 + nc * 48 + nl * 40 + ns * 44);
   body += "{\"hub\":\"" HUB_ID "\",\"sensors\":[";
   bool first = true;
   for (int i = 0; i < MAX_SENSORS; i++) {
@@ -660,6 +687,14 @@ static void uploadBatch() {
     if (k) body += ',';
     body += '['; body += l.ts; body += ",\""; body += nodes[l.node].mac; body += "\",";
     body += String(l.lux, 1); body += ']';
+  }
+  body += "],\"soil\":[";
+  for (int k = 0; k < ns; k++) {
+    const SoilRec &r = soilQ[(sHead + k) % SOIL_LEN];
+    if (k) body += ',';
+    body += '['; body += r.ts; body += ",\""; body += nodes[r.node].mac; body += "\","; body += r.ec; body += ',';
+    if (r.soilX100 == INT16_MIN) body += "null"; else body += String(r.soilX100 / 100.0f, 2);
+    body += ']';
   }
   body += "]}";
   xSemaphoreGive(lock);
@@ -729,12 +764,15 @@ static void uploadBatch() {
     int dropL = nl < lCount ? nl : lCount;
     lHead = (lHead + dropL) % LIGHT_LEN;
     lCount -= dropL;
+    int dropS = ns < sCount ? ns : sCount;
+    sHead = (sHead + dropS) % SOIL_LEN;
+    sCount -= dropS;
     xSemaphoreGive(lock);
     uploadedTotal += n;
     lastUploadOk = millis();
   }
-  Serial.printf("Upload %d readings + %d air + %d light -> HTTP %d (queued %d)  heap %u free, %u largest\n",
-                n, nc, nl, code, qCount, (unsigned)freeHeap, (unsigned)maxBlock);
+  Serial.printf("Upload %d readings + %d air + %d light + %d soil EC -> HTTP %d (queued %d)  heap %u free, %u largest\n",
+                n, nc, nl, ns, code, qCount, (unsigned)freeHeap, (unsigned)maxBlock);
   if (code == -100) Serial.println("  skipped: too little free memory for a secure connection");
   else if (code < 0) Serial.printf("  %s%s\n", HTTPClient::errorToString(code).c_str(), tlsErr[0] ? (String(" / TLS: ") + tlsErr).c_str() : "");
   if (reply.length()) applyCloudCfg(reply);
@@ -1494,6 +1532,12 @@ static uint32_t nodeCheck(int i, const char *mac, uint8_t type, float volt, bool
     nodeStatus(i, linked ? "linked to another hub: press its reset button" : "not linked: press its reset button");
     return 3600000;
   }
+  if (NODE_FW_BUNDLED && !dfuSameBoard(NODE_FW_VERSION, ver.c_str())) {   // v0.13: an EVT1 node keeps its own build
+    nodeDisconnect();
+    nodes[i].fails = 0;
+    nodeStatus(i, "%s is built for another board: update it over USB", ver.c_str());
+    return CHECK_EVERY_MS;
+  }
   if (!NODE_FW_BUNDLED || dfuVersionCompare(NODE_FW_VERSION, ver.c_str()) <= 0) {
     nodeDisconnect();
     nodes[i].fails = 0;
@@ -1729,6 +1773,7 @@ static void handleDiagApi() {
   jsonKV(j, "q", (long)qCount); jsonKV(j, "qMax", (long)QUEUE_LEN);
   jsonKV(j, "c", (long)cCount); jsonKV(j, "cMax", (long)CLIM_LEN);
   jsonKV(j, "l", (long)lCount); jsonKV(j, "lMax", (long)LIGHT_LEN);
+  jsonKV(j, "s", (long)sCount); jsonKV(j, "sMax", (long)SOIL_LEN);
   jsonKV(j, "streak", (long)uploadFailStreak);
   // How far behind the cloud is: age of the oldest reading still waiting to be sent.
   jsonKV(j, "oldestS", (qCount && epoch > 1700000000) ? (long)(epoch - queue_[qHead].ts) : (qCount ? -2L : -1L));

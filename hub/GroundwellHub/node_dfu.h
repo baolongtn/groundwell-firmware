@@ -121,6 +121,15 @@ static const char *dfuTransfer(DfuLink &l, const uint8_t *bin, uint32_t len, con
 }
 
 // "0.10.0" > "0.9.1": compares dotted numbers left to right. Text after the numbers is ignored.
+// v0.13: a node build for another board carries a suffix ("0.13.0-evt1"). The hub updates a node only with a build
+// for the same board: same suffix after the numbers (none for the breadboard node), compared up to any ';'.
+static bool dfuSameBoard(const char *bundled, const char *node) {
+  while (*bundled && (*bundled == '.' || (*bundled >= '0' && *bundled <= '9'))) bundled++;
+  while (*node && (*node == '.' || (*node >= '0' && *node <= '9'))) node++;
+  while (*bundled && *bundled != ';' && *node && *node != ';') if (*bundled++ != *node++) return false;
+  return (!*bundled || *bundled == ';') && (!*node || *node == ';');
+}
+
 static int dfuVersionCompare(const char *a, const char *b) {
   for (int i = 0; i < 4; i++) {
     long x = 0, y = 0;

@@ -1,4 +1,4 @@
-# GROUNDWELL v0.12: factory-calibrated nodes, soil, air, light and UV at the plant, sensors on the hub too, a 0-100 health score, cloud history
+# GROUNDWELL v0.13: factory-calibrated nodes, soil, air, light and UV at the plant, soil EC on the EVT1 board, sensors on the hub too, a 0-100 health score, cloud history
 
 ```
 [XIAO nRF52840 node] --Bluetooth, every 30 s--> [XIAO ESP32-C6 hub] --HTTPS, every 60 s--> [Cloudflare Worker + D1]
@@ -10,7 +10,13 @@
   LTR390 / VEML7700 / GL5539 light, LTR390 UV                                                air + light history, once a minute
 ```
 
-**Versions:** node firmware v0.12.0 (XIAO and the Nano ESP32 test node), hub firmware v0.12.1 (the hub updates its nodes for you, section 6; diagnostics and health checks, section 5; sensors on the hub, section 4b), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
+**Versions:** node firmware v0.13.0 (XIAO, the EVT1 board and the Nano ESP32 test node), hub firmware v0.13.0 (the hub updates its nodes for you, section 6; diagnostics and health checks, section 5; sensors on the hub, section 4b), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
+
+**New in v0.13 (node and hub)**
+- **EVT1 board build.** The node sketch builds for the GROUNDWELL EVT1 circuit board: set `GW_BOARD` to `BOARD_EVT1` at the top of `GroundwellNode.ino` (the GitHub build makes both, `GroundwellNode-evt1.uf2` and `.zip` for EVT1). The breadboard build is unchanged. On EVT1 the node reads the moisture electrode (2 MHz drive on D3, peak detector on A2), the EC pads (alternating drive on D7 / D6, read on A0), the soil NTC (D8 / A1), the SHT40 and LTR-390 on D4 / D5, and the button on D9 (a press gives FAST readings for 5 minutes).
+- **Soil EC and soil temperature.** Odd readings carry soil conductivity (BTHome 0x56, uS/cm, bulk soil at its own temperature) and soil temperature (0x58) in place of the UV index; even readings carry UV, so every packet still fits 26 bytes. The hub queues one soil reading a minute per node and uploads it as `"soil":[[ts,"MAC",ec_us,soil_c],...]`. The cloud turns it into a feed level (corrected to 25 C and for moisture).
+- **EC calibration, once per board:** stand the stake in a conductivity standard up to the soil line (1413 uS/cm KCl is common and cheap) and send `CAL EC 1413` over USB serial. The node measures its pads' cell constant and keeps it in flash. `CAL EC CLEAR` goes back to the default. `INFO` shows `board=evt1 eccal=yes k=...` and the last soil reading.
+- **The hub keeps each board on its own firmware.** EVT1 builds report `0.13.0-evt1`. The hub only updates a node with a build for the same board, so it never pushes its bundled breadboard firmware onto an EVT1 node (the node page says "built for another board: update it over USB").
 
 **New in v0.12.1 (hub)**
 - **Crash fix.** The Bluetooth library keeps a copy of every device it hears (phones, watches, TVs, all of them, with addresses that change every few minutes) and never limits that list. The hub only emptied it at each cloud upload, and not at all while Wi-Fi was down or uploads were off, so in a busy room the list grew until an allocation on the Bluetooth task failed and the hub restarted (`abort()` on `nimble_host`). v0.12.0 had less free memory than v0.11.1 and hit this within minutes: it crashed three times on trial and rolled back. The list is now emptied every 10 s, whatever else the hub is doing.

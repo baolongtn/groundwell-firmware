@@ -19,6 +19,9 @@
 //   serial port moves onto D6/D7.
 // Which of these are fitted is set on http://plants.local/setup ("Sensors wired to this hub").
 #pragma once
+#ifndef GW_EVT1
+#define GW_EVT1 0                                    // the node sketch's EVT1 board code is left out of the hub
+#endif
 #ifndef HUB_I2C_SENSORS
   #define HUB_I2C_SENSORS 1              // 0 leaves the I2C sensors out of the build: about 25 KB less flash
 #endif
@@ -99,12 +102,17 @@ static uint16_t avgRead(int pin, uint8_t n) {
 }
 
 // Capacitive probe: power it, let the 555 + filter settle, read, power off.
+// EVT1 board: its moisture electrode instead, on the same scale (LOWER = wetter), so calibration is unchanged.
 static uint16_t readCapacitive() {
+#if GW_EVT1
+  return readElectrode();
+#else
   digitalWrite(PIN_CAP_POWER, HIGH);
   delay(CAP_SETTLE_MS);
   uint16_t v = avgRead(PIN_CAP_AOUT, OVERSAMPLE);
   digitalWrite(PIN_CAP_POWER, LOW);
   return v;                                          // 0..4095 of VDD (ratiometric)
+#endif
 }
 
 // isnan() is unreliable with fast-math; check the float's exponent bits instead (same as the node).
@@ -428,6 +436,18 @@ static uint8_t buildBTHome(uint8_t *b, uint8_t pid, bool airOk, float tempC, flo
     b[n++] = 0x46; b[n++] = (uint8_t)(u <= 0 ? 0 : u >= 255.0f ? 255 : lroundf(u));
   }
   return n;                                          // 23 bytes with air + light + UV (the legacy advert allows 26), 11 with none
+}
+// EVT1 soil block (v0.13), added after buildBTHome's objects so the IDs still ascend:
+//         | [56 conductivity uS/cm (u16)] | [58 soil temperature (s8, 0.35 C steps)]
+// The conductivity is the bulk soil reading at the soil's own temperature: the cloud corrects it to 25 C and for
+// moisture. It goes out on alternate readings in place of the UV index, so a full packet is still 26 bytes.
+__attribute__((unused)) static uint8_t appendSoil(uint8_t *b, uint8_t n, bool ecOk, uint16_t ecUs, bool soilOk, float soilC) {
+  if (ecOk) { b[n++] = 0x56; b[n++] = (uint8_t)(ecUs & 0xFF); b[n++] = (uint8_t)(ecUs >> 8); }
+  if (soilOk) {
+    long t = lroundf(soilC / 0.35f);
+    b[n++] = 0x58; b[n++] = (uint8_t)(int8_t)(t < -128 ? -128 : t > 127 ? 127 : t);
+  }
+  return n;
 }
 // ---- end BTHome packet ----
 

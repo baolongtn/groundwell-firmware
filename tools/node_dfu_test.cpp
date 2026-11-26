@@ -138,6 +138,14 @@ int main() {
     char name[64]; snprintf(name, sizeof name, "version compare %s vs %s = %d", t.a[0] ? t.a : "(none)", t.b, t.want);
     check(got == t.want, name);
   }
+  // v0.13: the hub updates a node only with a build for its own board
+  struct { const char *bundled, *node; bool want; } bd[] = {{"0.13.0", "0.12.0", true}, {"0.13.0", "0.13.0-evt1", false},
+    {"0.13.0-evt1", "0.12.0-evt1", true}, {"0.13.0-evt1", "0.12.0", false}, {"0.13.0", "", true}, {"0.13.0", "0.13.0-evt1;l=1", false},
+    {"0.13.0", "0.12.0;l=1", true}, {"0.13.0-evt1", "0.13.0-evt2", false}};
+  for (auto &t : bd) {
+    char name[80]; snprintf(name, sizeof name, "same board %s / %s = %s", t.bundled, t.node[0] ? t.node : "(none)", t.want ? "yes" : "no");
+    check(dfuSameBoard(t.bundled, t.node) == t.want, name);
+  }
   printf("%d of %d passed\n", total - fails, total);
   return fails ? 1 : 0;
 }

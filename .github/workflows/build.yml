@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Host tests (link key HMAC, node update protocol, hub web update check, packets, hub packet handling)
+      - name: Host tests (link key HMAC, node update protocol, hub web update check, packets, hub packet handling, sensor and soil math)
         run: |
           cmp node/GroundwellNode/gw_hmac.h hub/GroundwellHub/gw_hmac.h || { echo "gw_hmac.h differs between node and hub"; exit 1; }
           # The hub reads its own sensors with the node's code (local_sensors.h): fail if the copies drift apart.
@@ -29,6 +29,10 @@ jobs:
           g++ -std=c++17 -Wall -o /tmp/roundtrip bthome_roundtrip_test.cpp && /tmp/roundtrip
           python3 hub_packet_test_extract.py
           g++ -std=c++17 -Wall -Wno-unused-function -Wno-volatile -o /tmp/hubpkt hub_packet_test.cpp && /tmp/hubpkt
+          python3 -c "s=open('../node/GroundwellNode/GroundwellNode.ino').read(); a=s.index('// ---- sensor math'); b=s.index('// ---- end sensor math'); open('node_math.inc','w').write(s[a:b])"
+          g++ -std=c++17 -Wall -o /tmp/sensormath sensor_math_test.cpp && /tmp/sensormath
+          python3 -c "s=open('../node/GroundwellNode/GroundwellNode.ino').read(); a=s.index('// ---- soil math'); b=s.index('// ---- end soil math'); open('node_soil.inc','w').write(s[a:b])"
+          g++ -std=c++17 -Wall -Wextra -o /tmp/soilmath soil_math_test.cpp && /tmp/soilmath
 
       - uses: arduino/setup-arduino-cli@v2
 
@@ -61,6 +65,17 @@ jobs:
           curl -sSL -o uf2conv.py https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2conv.py
           curl -sSL -o uf2families.json https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2families.json
           python3 uf2conv.py -c -f 0xADA52840 -o build/node/GroundwellNode.uf2 build/node/GroundwellNode.ino.hex
+
+      - name: Build node for the EVT1 board (XIAO nRF52840 on the GROUNDWELL PCB)
+        run: |
+          # Same sketch with GW_BOARD = BOARD_EVT1: moisture electrode, soil EC and NTC, SHT40 + LTR-390, button.
+          # Flashed over USB or nRF Connect: the hub never pushes its bundled (breadboard) build to an EVT1 node.
+          arduino-cli compile --warnings default --fqbn Seeeduino:nrf52:xiaonRF52840 \
+            --build-property "compiler.cpp.extra_flags=-DGW_BOARD=BOARD_EVT1" \
+            --output-dir build/node-evt1 node/GroundwellNode 2>&1 | tee build/node-evt1.log
+          test -f build/node-evt1/GroundwellNode.ino.zip
+          python3 uf2conv.py -c -f 0xADA52840 -o build/node-evt1/GroundwellNode-evt1.uf2 build/node-evt1/GroundwellNode.ino.hex
+          cp build/node-evt1/GroundwellNode.ino.zip build/node-evt1/GroundwellNode-evt1.zip
 
       - name: Build node test variant (Arduino Nano ESP32)
         run: |
@@ -126,6 +141,7 @@ jobs:
           HUB=$(grep -oP 'Sketch uses \K[0-9]+' build/hub.log)
           NODE=$(grep -oP 'Sketch uses \K[0-9]+' build/node.log || echo "?")
           NANO=$(grep -oP 'Sketch uses \K[0-9]+' build/node-nano-esp32.log || echo "?")
+          EVT1=$(grep -oP 'Sketch uses \K[0-9]+' build/node-evt1.log || echo "?")
           OTA_SLOT=1966080   # one app slot in partitions.csv
           {
             echo "## Firmware size"
@@ -133,6 +149,7 @@ jobs:
             echo "|---|---|---|"
             echo "| Hub app (with the node firmware inside) | $HUB | OTA slot holds $OTA_SLOT: $(( HUB * 100 / OTA_SLOT ))% of it, $(( OTA_SLOT - HUB )) bytes free |"
             echo "| Node app | $NODE | bundled into the hub |"
+            echo "| Node app, EVT1 board | $EVT1 | flashed over USB or nRF Connect |"
             echo "| Node app, Arduino Nano ESP32 test node | $NANO | flashed over USB |"
             if [ -n "${HUB_FLAGS:-}" ]; then echo; echo "**Hub built with ${HUB_FLAGS}:** it didn't fit one update slot with its I2C sensors, so this build leaves them out (the capacitive probe, DHT11 and photoresistor still work)."; fi
           } >> "$GITHUB_STEP_SUMMARY"
@@ -148,6 +165,8 @@ jobs:
             build/node/GroundwellNode.ino.hex
             build/node/GroundwellNode.ino.zip
             build/node/GroundwellNode.uf2
+            build/node-evt1/GroundwellNode-evt1.uf2
+            build/node-evt1/GroundwellNode-evt1.zip
             build/node-nano-esp32/GroundwellNode-nano-esp32.bin
             build/node-nano-esp32/GroundwellNode-nano-esp32.merged.bin
           if-no-files-found: warn

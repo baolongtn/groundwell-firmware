@@ -142,6 +142,24 @@ int main() {
   CHECK(hSlots == H_SLOTS);
   CHECK(nodes[a].rx == 300);                              // the since-start counters stay
 
+  // 8. EVT1 soil (v0.13): EC on alternate readings, queued for the cloud once a minute per node.
+  const char *E = "AA:BB:CC:DD:EE:0E";
+  int sc0 = sCount;
+  for (int k = 1; k <= 8; k++) {
+    fakeMs += 30000; fakeEpoch += 30;
+    BTHomePacket p = pkt((uint8_t)k, true, 0);
+    if (k & 1) { p.hasEC = true; p.ec = (uint16_t)(1000 + k); p.hasSoilT = (k != 5); p.soilC = 20.3f; }
+    handlePacket(E, -60, 1, true, p);
+  }
+  int e = findNode(E, false);
+  CHECK(e >= 0 && nodes[e].hasEC && nodes[e].ec == 1007 && nodes[e].hasSoilT);
+  CHECK(sCount == sc0 + 4);                               // readings 1, 3, 5, 7: one a minute
+  const SoilRec &s1 = soilQ[(sHead + sc0) % SOIL_LEN], &s3 = soilQ[(sHead + sc0 + 2) % SOIL_LEN];
+  CHECK(s1.node == e && s1.ec == 1001 && s1.soilX100 == 2030);
+  CHECK(s3.ec == 1005 && s3.soilX100 == INT16_MIN);       // reading 5 had no soil temperature
+  CHECK(findSensor(e, 0, false) >= 0 && sensors[findSensor(e, 0, false)].fcal);   // moisture still lands on channel 0
+  CHECK(findSensor(e, 1, false) < 0);                     // EC is not mistaken for a second probe
+
   printf(fails ? "%d FAILURES\n" : "ALL PASS\n", fails);
   return fails ? 1 : 0;
 }

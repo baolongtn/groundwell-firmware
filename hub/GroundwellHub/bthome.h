@@ -21,6 +21,10 @@ struct BTHomePacket {
   float    uv;          // UV index, 0.1 steps (v0.9 nodes with an LTR390)
   bool     hasMoist;
   float    moist;       // moisture %, 0.01 steps (GROUNDWELL: factory-calibrated capacitive probe, 0 = air, 100 = water)
+  bool     hasEC;
+  uint16_t ec;          // conductivity, uS/cm (GROUNDWELL EVT1: bulk soil EC at the soil's own temperature)
+  bool     hasSoilT;
+  float    soilC;       // a second temperature object (0x45 / 0x57 / 0x58): GROUNDWELL EVT1 soil temperature, C
   uint8_t  nCounts;
   uint32_t counts[4];   // probe readings, in packet order
 };
@@ -37,8 +41,8 @@ static inline bool parseBTHome(const uint8_t *d, size_t n, BTHomePacket &p) {
     uint8_t id = d[i++];
     size_t need;
     switch (id) {
-      case 0x00: case 0x01: case 0x09: case 0x2E: case 0x2F: case 0x46: need = 1; break;
-      case 0x02: case 0x03: case 0x0C: case 0x14: case 0x3D: case 0x08: need = 2; break;
+      case 0x00: case 0x01: case 0x09: case 0x2E: case 0x2F: case 0x46: case 0x57: case 0x58: need = 1; break;
+      case 0x02: case 0x03: case 0x0C: case 0x14: case 0x3D: case 0x08: case 0x45: case 0x56: need = 2; break;
       case 0x04: case 0x05: case 0x0A: case 0x0B: need = 3; break;
       case 0x3E: need = 4; break;
       default: return p.nCounts > 0 || p.hasMoist || p.hasPid; // unknown object: stop, keep what we have
@@ -55,6 +59,10 @@ static inline bool parseBTHome(const uint8_t *d, size_t n, BTHomePacket &p) {
       case 0x05: p.hasLux = true;  p.lux = ((uint32_t)v[0] | ((uint32_t)v[1] << 8) | ((uint32_t)v[2] << 16)) / 100.0f; break;
       case 0x14: p.hasMoist = true; p.moist = (uint16_t)(v[0] | (v[1] << 8)) / 100.0f; break;
       case 0x46: p.hasUV = true;    p.uv = v[0] / 10.0f; break;
+      case 0x56: p.hasEC = true;    p.ec = (uint16_t)(v[0] | (v[1] << 8)); break;
+      case 0x45: p.hasSoilT = true; p.soilC = (int16_t)(v[0] | (v[1] << 8)) / 10.0f; break;
+      case 0x57: p.hasSoilT = true; p.soilC = (int8_t)v[0]; break;
+      case 0x58: p.hasSoilT = true; p.soilC = (int8_t)v[0] * 0.35f; break;
       case 0x09: if (p.nCounts < 4) p.counts[p.nCounts++] = v[0]; break;
       case 0x3D: if (p.nCounts < 4) p.counts[p.nCounts++] = (uint16_t)(v[0] | (v[1] << 8)); break;
       case 0x3E: if (p.nCounts < 4) p.counts[p.nCounts++] = (uint32_t)v[0] | ((uint32_t)v[1] << 8) |
