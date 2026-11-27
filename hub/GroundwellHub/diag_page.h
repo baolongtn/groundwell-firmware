@@ -117,7 +117,7 @@ function nodeHealth(n,d){
   if(!n.conn)add(-1,'Broadcast-only test node: the hub can\'t check or update its firmware','Flash it over USB'+(E.nodeFw?' to '+E.nodeFw:'')+'.');
   else if(!n.fw||n.fw=='?'){if(d.uptimeS>900)add(1,'Firmware not checked yet','Press Refresh in its details, or its reset button.')}
   else if(E.bundled){const c=vcmp(n.fw,E.nodeFw);if(c<0)add(1,'Firmware '+n.fw+', expected '+E.nodeFw+(n.upd?' (updating now)':''),n.upd?'Leave it in range until it finishes.':'The hub updates it at its next check; see its Updates column.');else if(c>0)add(1,'Firmware '+n.fw+' is newer than the '+E.nodeFw+' this hub carries','Update the hub so the two match.')}
-  if(five)add(1,'Sends every 5 s: firmware before 0.9, or in FAST mode','Update it; 0.9 and later send every 30 s and last far longer on a coin cell.');
+  if(five)add(1,'Sends every 5 s: firmware before 0.9, or in FAST mode','Update it; 0.9 and later send every 30 s, 0.13 and later every 60 s, and last far longer on a battery.');
   const st=n.st||'';if(/fail|stuck|press its reset|refused|no update service/.test(st))add(/stuck|update failed/.test(st)?2:1,'Update status: '+st,/press its reset/.test(st)?'Press the node\'s reset button once; the hub links it within a minute.':'See the event log.');
   if(n.restarts)add(n.restarts>3?1:-1,'Restarted '+n.restarts+' time'+(n.restarts>1?'s':'')+' since the hub started','Repeated restarts usually mean a sagging coin cell or a loose battery.');
  }
@@ -257,7 +257,7 @@ function render(d){
  $('log').innerHTML=d.log.length?d.log.map(e=>'<tr><td>'+when(e,d)+'</td><td>'+esc(e.t)+'</td></tr>').join(''):'<tr><td>Nothing yet.</td></tr>';
 }
 function tog(i){open[i]=!open[i];if(last)render(last)}
-async function refresh(i){const s=$('rf'+i);try{const r=await fetch('/api/diag/check',{method:'POST',body:new URLSearchParams({i})});if(s)s.textContent=r.ok?'The hub checks this node at its next burst (within about 30 s).':'Refused ('+r.status+')'}catch(e){if(s)s.textContent='No answer'}}
+async function refresh(i){const s=$('rf'+i);try{const r=await fetch('/api/diag/check',{method:'POST',body:new URLSearchParams({i})});if(s)s.textContent=r.ok?'The hub checks this node at its next burst (within about a minute).':'Refused ('+r.status+')'}catch(e){if(s)s.textContent='No answer'}}
 function snapshot(){if(!last)return;const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({diag:last,health:health&&{verdict:health.text,findings:health.out}},null,1)],{type:'application/json'}));a.download='groundwell-diag-'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';document.body.appendChild(a);a.click();a.remove()}
 async function tick(){try{const r=await fetch('/api/diag',{cache:'no-store'});if(!r.ok)throw'HTTP '+r.status;render(await r.json());$('err').textContent=''}catch(e){$('err').textContent='hub not answering ('+e+'), retrying'}setTimeout(tick,2000)}
 tick();

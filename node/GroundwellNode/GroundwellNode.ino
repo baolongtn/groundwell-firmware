@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL sensor node v0.12.0  (capacitive soil probe + air temperature/humidity + light + UV, one board)
+  GROUNDWELL sensor node v0.13.0  (capacitive soil probe + air temperature/humidity + light + UV, one board)
   Board:  Seeed XIAO nRF52840 (plain or Sense)
           Arduino IDE: Boards Manager URL
             https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
@@ -19,12 +19,17 @@
     Serial command UNLINK forgets the link key.
   v0.12: the rod probe is gone (the capacitive probe is the soil sensor), so the packet is 3 bytes shorter and
   pins D2, D3 and D4 are free.
+  v0.13 (battery prep): one reading a minute instead of every 30 s. The XIAO's unused 2 MB QSPI flash chip is
+  put to sleep at boot (it idles at about 20 uA otherwise). The DHT11 can be powered from D3 instead of 3V3, so
+  its 100 to 150 uA standby current only flows for about 3 s a minute: move its VCC wire to D3. Left on 3V3 it
+  works as before. FAST now takes effect within 5 s. New serial command SETTLE shows how long the capacitive
+  probe takes to settle after power-up.
   Diagnostics (v0.11): a read-only characteristic reports uptime, why it last restarted, readings sent,
   air-sensor read failures, sensors, calibration, link, update window, radio power, interval, connections
   and failed link-key attempts. The hub reads it at each check and shows it on http://plants.local/diag.
 
   What it does
-    Every REPORT_MS (30 s) it reads the capacitive probe, air temperature/humidity and light, then broadcasts one
+    Every REPORT_MS (60 s) it reads the capacitive probe, air temperature/humidity and light, then broadcasts one
     BTHome v2 packet for ADV_BURST_S (6 s) and lets the radio sleep until the next reading:
       packet id, air temperature + humidity (best sensor found; skipped if a read fails or looks like a glitch),
       illuminance in lux, supply voltage (the hub and cloud derive battery level from it),
@@ -32,8 +37,9 @@
                         or, before factory calibration, its raw count (0..4095, LOWER = wetter)
       UV index:         only with an LTR390 fitted
     Low power, on USB or battery alike: the CPU sleeps between readings, the capacitive probe and photoresistor
-    are powered only while reading, the I2C sensors sit in standby between readings, and the radio
-    is off except for the 6 s burst after each reading.
+    are powered only while reading, the I2C sensors sit in standby between readings, the QSPI flash chip sleeps,
+    the DHT11 is powered only while reading (if its VCC is on D3), and the radio is off except for the 6 s
+    burst after each reading.
 
   Air and light sensors (LIGHT_I2C wiring): found automatically at boot, best first
       temperature/humidity  Sensirion SHT40/41/45 (0x44) -> AHT20 (0x38) -> DHT11 on D6
@@ -51,6 +57,8 @@
       CAL SET <air> <water>  enter the two points by hand (same limit checks)
       CAL CLEAR            erase the calibration (the node goes back to sending raw counts)
       FAST                 readings every 5 s for the next 5 minutes (factory checks and bench tests)
+      SETTLE               capacitive probe output every 10 ms for 500 ms after power-up (v0.13): hold the
+                           probe still in air or water, run it a few times, and see where it stops moving
     Every reply starts with INFO or CAL and ends in OK, PASS or FAIL, so tools/factory_cal.py can drive it.
     The calibration lives on the node, so a node ships calibrated with no plant and no hub settings.
 
@@ -68,9 +76,10 @@
       yellow AOUT  -> XIAO D0/A0
     DHT11 module (3 pins, labels vary: S/DATA, +/VCC, -/GND)
       S / DATA     -> XIAO D6                                            (was D5 before v0.4)
-      + / VCC      -> XIAO 3V3
+      + / VCC      -> XIAO D3    for battery (v0.13): powered only while reading. 3V3 still works, always on.
       - / GND      -> XIAO GND
-      Bare 4-pin DHT11 (no module board): add a 10 kOhm pull-up from DATA to 3V3.
+      Bare 4-pin DHT11 (no module board): add a 10 kOhm pull-up from DATA to the same pin as its VCC (D3 or 3V3).
+      Never pull DATA up to 3V3 while VCC is on D3: the sensor would draw power through its data pin.
     GL5539 photoresistor (LIGHT_LDR, default)
       leg 1        -> XIAO D7    (powered only for a few ms per reading)
       leg 2        -> XIAO D5/A5
@@ -103,12 +112,12 @@
         the capacitive probe then reads on the same scale.
     Nano ESP32 wiring (every analog input on ADC1, A0..A3; D and A pins are separate pins on the Nano)
       Capacitive   black GND -> GND, red VCC -> D2, yellow AOUT -> A0
-      DHT11        DATA -> D6, VCC -> 3V3 (never 5V: the Nano's pins are 3.3 V only), GND -> GND
+      DHT11        DATA -> D6, VCC -> 3V3 or D3 (never 5V: the Nano's pins are 3.3 V only), GND -> GND
       GL5539       leg 1 -> D7, leg 2 -> A3, 1 kOhm between A3 and GND
       I2C sensors  (LIGHT_I2C) SDA -> A4, SCL -> A5
 */
 
-static const char *FW_VERSION = "0.12.0";
+static const char *FW_VERSION = "0.13.0";
 
 // ---------------- light sensor choice ----------------
 #define LIGHT_LDR      1                         // GL5539 photoresistor + DHT11, no I2C (the parts in hand)
@@ -148,7 +157,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #endif
 
 // ---------------- settings ----------------
-static const uint32_t REPORT_MS       = 30000; // new reading every 30 s (soil changes over hours)
+static const uint32_t REPORT_MS       = 60000; // new reading every 60 s (soil changes over hours; v0.9 to v0.12: 30 s)
 static const uint32_t FAST_REPORT_MS  = 5000;  // after a FAST command, for FAST_FOR_MS
 static const uint32_t FAST_FOR_MS     = 300000;
 static const uint16_t ADV_INTERVAL_MS = 250;   // within a burst, repeat the packet every 250 ms ...
@@ -162,6 +171,12 @@ static const uint32_t DFU_WINDOW_MS   = 10UL * 60 * 1000;   // Bluetooth updates
 static const uint16_t CAP_SETTLE_MS   = 150;   // capacitive probe power-up settle
 static const uint8_t  OVERSAMPLE      = GW_ESP32 ? 64 : 16;   // the ESP32's ADC is noisier: average more
 #define DHT_TYPE DHT11                           // DHT22 if you upgrade the sensor
+// DHT11 powered from PIN_DHT_POWER (v0.13). Its datasheet asks for 1 s after power-up before the first command,
+// and each read returns the sensor's previous measurement, so the first read after power-up may be stale.
+// The node reads twice and sends the second; the serial line shows the first too ("1st ..."). If the two
+// always agree on your sensors, set DHT_SECOND_MS to 0: the DHT11 is then on for about 1.2 s a minute, not 3.3 s.
+static const uint16_t DHT_WARMUP_MS   = 1200;
+static const uint16_t DHT_SECOND_MS   = 2100;  // the DHT library allows one real read per 2 s
 
 // Photoresistor model (LIGHT_LDR only). lux = 10 * (LDR_R10_OHMS / R) ^ (1 / LDR_GAMMA)
 // GL5539 datasheet: 50 to 100 kOhm at 10 lux, gamma about 0.8. Parts vary by up to about +-40%:
@@ -187,6 +202,7 @@ static const char    *CAL_FILE      = "/gwcal.bin";
 static const int PIN_CAP_AOUT  = A0;   // D0
 static const int PIN_CAP_POWER = D1;
 static const int PIN_DHT       = D6;
+static const int PIN_DHT_POWER = D3;   // DHT11 VCC for battery use (v0.13); nothing happens if VCC stays on 3V3
 #if LIGHT_SENSOR != LIGHT_I2C
 static const int PIN_LDR_POWER = D7;
 static const int PIN_LDR_SENSE = A5;   // D5
@@ -199,6 +215,7 @@ __attribute__((unused)) static const char *I2C_PINS = "D4/D5";
 static const int PIN_CAP_AOUT  = A0;
 static const int PIN_CAP_POWER = D2;
 static const int PIN_DHT       = D6;
+static const int PIN_DHT_POWER = D3;
 #if LIGHT_SENSOR != LIGHT_I2C
 static const int PIN_LDR_POWER = D7;
 static const int PIN_LDR_SENSE = A3;
@@ -240,6 +257,10 @@ static SemaphoreHandle_t wakeSem;                    // lets a Bluetooth event w
 // Diagnostics (v0.11)
 static uint32_t readings = 0, airFails = 0, connects = 0, authFails = 0;
 static uint32_t fastUntil = 0;                        // FAST command: 5 s readings until this millis()
+static bool fastKick = false;                         // FAST just arrived: bring the next reading forward (v0.13)
+static uint32_t dhtOnAt = 0;                          // when the DHT11's power pin went high this cycle
+static bool dht1Ok = false;                           // the first DHT11 read after power-up, for the serial line
+static float dht1T = 0, dht1H = 0;
 // Declared here, before any function: the Arduino IDE puts a prototype of every function above the first one.
 struct AirFilter { bool have, pend; float t, h, pt, ph; };
 
@@ -505,6 +526,100 @@ static bool readAir(float &tempC, float &rh) {
   return readDHT(tempC, rh);
 }
 
+// ---------------- battery helpers (v0.13) ----------------
+// The CPU sleeps in delay() (FreeRTOS idle on the XIAO), so these waits cost almost nothing.
+static void sleepUntil(uint32_t t) {
+  int32_t left = (int32_t)(t - millis());
+  if (left > 0) delay((uint32_t)left);
+}
+
+// True when the air reading comes from the DHT11 (no SHT4x or AHT20 found on I2C).
+static bool dhtInUse() {
+#if LIGHT_SENSOR == LIGHT_I2C
+  return !shtOk && !ahtOk;
+#else
+  return true;
+#endif
+}
+
+// DHT11 power from PIN_DHT_POWER. If its VCC is still on 3V3 this does nothing harmful: the pin just has
+// nothing on it, and the sensor stays powered as before.
+static void dhtPowerOn() {
+  digitalWrite(PIN_DHT_POWER, HIGH);
+  dhtOnAt = millis();
+}
+static void dhtPowerOff() {
+  digitalWrite(PIN_DHT_POWER, LOW);
+  pinMode(PIN_DHT, INPUT);    // the DHT library leaves its internal pull-up on, which would feed an unpowered sensor
+}
+
+// This cycle's air reading. With the DHT11: wait out its power-up time (the soil and light readings already ran
+// meanwhile), read once, read again DHT_SECOND_MS later and send that one, then power it off.
+static bool readAirCycle(float &tempC, float &rh) {
+  if (!dhtInUse()) return readAir(tempC, rh);
+  sleepUntil(dhtOnAt + DHT_WARMUP_MS);
+  dht1Ok = readDHT(dht1T, dht1H);
+  bool ok = dht1Ok;
+  tempC = dht1T; rh = dht1H;
+  if (DHT_SECOND_MS) {
+    delay(DHT_SECOND_MS);
+    ok = readDHT(tempC, rh);
+  }
+  dhtPowerOff();
+  return ok;
+}
+
+#if GW_NRF52
+// The XIAO nRF52840's 2 MB QSPI flash (P25Q16H) isn't used: calibration and the link key live in the nRF52's
+// own flash. Left alone it idles in standby at about 20 uA, more than the rest of the sleeping board. Send it
+// Deep Power-Down (0xB9) over plain SPI on its pins (P0.21 SCK, P0.25 CS, P0.20 IO0, P0.22 IO2/WP#,
+// P0.23 IO3/HOLD#), then leave it deselected. It sleeps until the next power cycle; every boot sends it again.
+static void flashSleep() {
+  const uint32_t CS = 25, SCK = 21, IO0 = 20, IO2 = 22, IO3 = 23;
+  const uint32_t OUT = (GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos) |
+                       (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos);
+  NRF_P0->OUTSET = (1UL << CS) | (1UL << IO2) | (1UL << IO3);   // deselected, write-protect and hold inactive
+  NRF_P0->OUTCLR = (1UL << SCK) | (1UL << IO0);
+  NRF_P0->PIN_CNF[CS] = OUT; NRF_P0->PIN_CNF[SCK] = OUT; NRF_P0->PIN_CNF[IO0] = OUT;
+  NRF_P0->PIN_CNF[IO2] = OUT; NRF_P0->PIN_CNF[IO3] = OUT;
+  delayMicroseconds(50);
+  NRF_P0->OUTCLR = 1UL << CS;
+  delayMicroseconds(1);
+  for (int8_t b = 7; b >= 0; b--) {                 // SPI mode 0, MSB first: set data, then a rising clock edge
+    if ((0xB9 >> b) & 1) NRF_P0->OUTSET = 1UL << IO0; else NRF_P0->OUTCLR = 1UL << IO0;
+    delayMicroseconds(1);
+    NRF_P0->OUTSET = 1UL << SCK;
+    delayMicroseconds(1);
+    NRF_P0->OUTCLR = 1UL << SCK;
+  }
+  delayMicroseconds(1);
+  NRF_P0->OUTSET = 1UL << CS;                        // the command runs when CS goes high
+  delayMicroseconds(20);
+}
+#endif
+
+// SETTLE: the capacitive probe's output every 10 ms for 500 ms after power-up, to choose CAP_SETTLE_MS from
+// data. Prints "SETTLE ms:count ..." and the first time after which every sample stays within 8 counts of the
+// 500 ms value. CAP_SETTLE_MS is 150 and factory calibration was taken at 150: if you shorten it, recalibrate.
+static void settleTest() {
+  static const uint8_t N = 51;
+  uint16_t v[N];
+  digitalWrite(PIN_CAP_POWER, HIGH);
+  uint32_t t0 = millis();
+  for (uint8_t i = 0; i < N; i++) {
+    sleepUntil(t0 + 10UL * i);
+    v[i] = avgRead(PIN_CAP_AOUT, OVERSAMPLE);
+  }
+  digitalWrite(PIN_CAP_POWER, LOW);
+  int settled = 0;
+  for (int i = N - 1; i >= 0; i--) {
+    if (abs((int)v[i] - (int)v[N - 1]) > 8) { settled = (i + 1) * 10; break; }
+  }
+  Serial.print("SETTLE ms:count");
+  for (uint8_t i = 0; i < N; i++) Serial.printf(" %u:%u", 10u * i, v[i]);
+  Serial.printf("\nSETTLE settled_ms=%d final=%u now_ms=%u OK\n", settled, v[N - 1], (unsigned)CAP_SETTLE_MS);
+}
+
 // Photoresistor on a divider: D7 (VDD) -> LDR -> A5 -> LDR_FIXED_OHMS -> GND.
 // The ADC is referenced to VDD, so adc/4095 = Rf / (R + Rf) whatever the supply voltage.
 __attribute__((unused)) static float ldrLux(uint16_t adc) {
@@ -679,7 +794,8 @@ static void handleCommand(char *line) {
 #else
   else if (!strcmp(line, "UNLINK"))    Serial.println("UNLINKED OK (this test node never links to a hub)");
 #endif
-  else if (!strcmp(line, "FAST"))      { fastUntil = millis() + FAST_FOR_MS; Serial.printf("FAST interval_ms=%lu for_s=%lu OK\n", (unsigned long)FAST_REPORT_MS, (unsigned long)(FAST_FOR_MS / 1000)); }
+  else if (!strcmp(line, "SETTLE"))    settleTest();
+  else if (!strcmp(line, "FAST"))      { fastUntil = millis() + FAST_FOR_MS; fastKick = true; Serial.printf("FAST interval_ms=%lu for_s=%lu OK\n", (unsigned long)FAST_REPORT_MS, (unsigned long)(FAST_FOR_MS / 1000)); }
   else if (line[0]) Serial.printf("ERR unknown command: %s\n", line);
 }
 
@@ -1020,9 +1136,14 @@ void setup() {
   pinMode(LED_GREEN, OUTPUT); digitalWrite(LED_GREEN, HIGH);
   pinMode(LED_BLUE, OUTPUT);  digitalWrite(LED_BLUE, HIGH);
 
+#if GW_NRF52
+  flashSleep();                                      // the unused QSPI flash chip: about 20 uA saved (v0.13)
+#endif
   pinMode(PIN_CAP_POWER, OUTPUT_STRONG);             // the probe pulls a few mA
   digitalWrite(PIN_CAP_POWER, LOW);
+  pinMode(PIN_DHT_POWER, OUTPUT_STRONG);             // DHT11 VCC on D3 (v0.13): up to 2.5 mA while measuring
   dht.begin();
+  dhtPowerOff();                                     // off until the first reading
   storeBegin();
   loadCal();
 #if LIGHT_SENSOR == LIGHT_I2C
@@ -1078,19 +1199,22 @@ void loop() {
   static uint32_t nextAt = 0;
   if (nextAt == 0) nextAt = millis();
 
+  // v0.13: the DHT11 powers up first; soil, supply, light and UV are read during its 1.2 s warm-up.
+  bool dhtNow   = dhtInUse();
+  if (dhtNow) dhtPowerOn();
   uint16_t cap  = readCapacitive();
   float vdd     = readVDD();
   lastVdd       = vdd;
-  float tempC = 0, rh = 0;
-  bool airRead  = readAir(tempC, rh);
-  readings++;
-  if (!airRead) airFails++;
-  static AirFilter airF = {false, false, 0, 0, 0, 0};
-  bool airOk    = airRead && airFilter(airF, tempC, rh);
   float lux = 0;
   bool luxOk    = readLight(lux);
   float uvi = 0;
   bool uvOk     = readUV(uvi);
+  float tempC = 0, rh = 0;
+  bool airRead  = readAirCycle(tempC, rh);
+  readings++;
+  if (!airRead) airFails++;
+  static AirFilter airF = {false, false, 0, 0, 0, 0};
+  bool airOk    = airRead && airFilter(airF, tempC, rh);
   int32_t capPct = calOk ? (int32_t)probeScaleX100(cap) : -1;
 
   uint8_t svc[31];
@@ -1100,10 +1224,14 @@ void loop() {
   lastSentAt = now;
 
   if (vdd < 1.6f) Serial.println("WARNING: VDD reading is impossible (the chip needs 1.7 V); please report this line.");
-  char airTxt[48], luxTxt[48], capTxt[32];
+  char airTxt[48], luxTxt[48], capTxt[32], dht1Txt[32] = "";
   if (airOk)        snprintf(airTxt, sizeof airTxt, "air %.1f C %.0f%%RH", tempC, rh);
   else if (airRead) snprintf(airTxt, sizeof airTxt, "air: %.1f C %.0f%%RH held (jump)", tempC, rh);
   else              snprintf(airTxt, sizeof airTxt, "air: %s read failed", airSrc);
+  if (dhtNow && DHT_SECOND_MS) {                     // the first read after power-up, to compare (see DHT_SECOND_MS)
+    if (dht1Ok) snprintf(dht1Txt, sizeof dht1Txt, " (1st %.1f C %.0f%%)", dht1T, dht1H);
+    else        snprintf(dht1Txt, sizeof dht1Txt, " (1st failed)");
+  }
 #if LIGHT_SENSOR == LIGHT_I2C
   if (luxOk) snprintf(luxTxt, sizeof luxTxt, uvOk ? "light %.0f lux uv %.1f" : "light %.0f lux", lux, uvi);
   else       snprintf(luxTxt, sizeof luxTxt, "light: none");
@@ -1112,7 +1240,7 @@ void loop() {
 #endif
   if (capPct >= 0) snprintf(capTxt, sizeof capTxt, "capacitive %4u = %5.1f%%", cap, capPct / 100.0f);
   else             snprintf(capTxt, sizeof capTxt, "capacitive %4u (uncal)", cap);
-  Serial.printf("#%u dt=%lums  %s  %s  %s  VDD %.2f V\n", packetId, (unsigned long)dt, capTxt, airTxt, luxTxt, vdd);
+  Serial.printf("#%u dt=%lums  %s  %s%s  %s  VDD %.2f V\n", packetId, (unsigned long)dt, capTxt, airTxt, dht1Txt, luxTxt, vdd);
 
   // Absolute schedule: the next reading is due REPORT_MS after the last one was due, however long this
   // one took. The wait is a loop on the clock, so it can't end early, and it answers serial commands.
@@ -1121,6 +1249,11 @@ void loop() {
   if ((int32_t)(millis() - nextAt) >= 0) nextAt = millis() + every;       // fell behind (a 10 s calibration, say)
   while ((int32_t)(nextAt - millis()) > 0) {
     serviceSerial();
+    if (fastKick) {                                  // FAST (v0.13): next reading within 5 s, not up to a minute
+      fastKick = false;
+      uint32_t soon = millis() + FAST_REPORT_MS;
+      if ((int32_t)(nextAt - soon) > 0) nextAt = soon;
+    }
 #if GW_NRF52
     serviceLink();
 #else

@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL hub v0.12.1
+  GROUNDWELL hub v0.13.0
   Board: Seeed XIAO ESP32-C6, Arduino core "esp32 by Espressif Systems" 3.x (NOT 4.x: it replaced the BLE API),
          board "XIAO_ESP32C6", Tools > Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)".
          The menu only sets the IDE's size check: partitions.csv in this folder replaces the layout with two
@@ -24,7 +24,7 @@
       about itself, the probes, and an event log. "Download snapshot" saves it all as one file for debugging.
   Sensors wired to the hub (v0.12)
     - The hub can carry its own sensors, like a node: capacitive probe, DHT11, photoresistor and the I2C
-      sensors (SHT4x, AHT20, LTR390). It reads them every 30 s with the node's own code
+      sensors (SHT4x, AHT20, LTR390). It reads them every 60 s (v0.12: 30 s) with the node's own code
       (local_sensors.h) and they show up as one more node, "wired to this hub". Wiring: local_sensors.h and
       docs/SETUP.md section 4b. Turn them on at /setup ("Sensors wired to this hub").
     - Factory calibration over USB with the node's commands (INFO, CAL AIR, CAL WATER, FAST) and tools/factory_cal.py.
@@ -68,6 +68,8 @@
     - Uploads to the GROUNDWELL cloud service once a minute (v0.9; the cloud keeps one soil reading per probe
       per minute). Readings queue up in RAM if Wi-Fi or the internet drops and are sent when it comes back.
     - v0.9 nodes send a reading every 30 s in a short radio burst (battery profile); v0.6 nodes (every 5 s) still work.
+    - v0.13 nodes send a reading every 60 s, and the hub expects that (NODE_INTERVAL_MS). Nodes on 0.12 or older
+      still work (their extra readings are dropped, and /diag flags their interval) until the hub updates them.
     - Probe names and calibration set on the cloud dashboard (Admin > Calibrate) come back in the
       upload reply and are applied and saved here, as if set on this page (v0.6.2).
 
@@ -132,9 +134,9 @@
   #define GW_CRASH_TEST 0      // 1 = rollback test build: crashes 20 s after every boot (the GitHub build makes one)
 #endif
 #if GW_CRASH_TEST
-  #define GW_FW_VERSION "0.12.1-crashtest"
+  #define GW_FW_VERSION "0.13.0-crashtest"
 #else
-  #define GW_FW_VERSION "0.12.1"
+  #define GW_FW_VERSION "0.13.0"
 #endif
 static const char *FW_VERSION = GW_FW_VERSION;
 // Optional secrets.h (git-ignored): WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY and optionally OTA_PASS.
@@ -173,10 +175,10 @@ static const char *FW_VERSION = GW_FW_VERSION;
 static const float SOIL_DRY_PS = 30.0f;          // bone-dry potting mix reads about this on the probe scale
 static const float SOIL_WET_PS = 75.0f;          // potting mix just watered and drained
 
-static const uint32_t NODE_INTERVAL_MS = 30000; // must match REPORT_MS on the nodes (v0.9: 30 s; v0.6 nodes send every 5 s and still work)
+static const uint32_t NODE_INTERVAL_MS = 60000; // must match REPORT_MS on the nodes (v0.13: 60 s; v0.9 to v0.12: 30 s; v0.6: 5 s)
 static const uint32_t UPLOAD_MS        = 60000; // one upload a minute keeps Cloudflare D1 well inside its free daily limits
 static const uint32_t DAY_BUCKET_MS    = 5UL * 60 * 1000;
-static const uint32_t STALE_MS         = 150000; // card shows "no signal" after this (5 missed readings)
+static const uint32_t STALE_MS         = 300000; // card shows "no signal" after this (5 missed readings at 60 s)
 static const uint32_t CLIMATE_MS       = 60000; // air temp/humidity and light sent to the cloud once a minute per node
 static const uint32_t WIFI_RETRY_MS    = 30000; // Wi-Fi down this long: start the connection over (rescans, picks any mesh point)
 static const uint32_t WIFI_REBOOT_MS   = 30UL * 60 * 1000;   // still down after this: restart the hub, once per outage
@@ -189,7 +191,7 @@ static const uint32_t SCAN_CLEAR_MS    = 10000;              // empty the Blueto
 static const int      SETUP_BTN_PIN    = BOOT_PIN;           // the BOOT button (GPIO 9 on the ESP32-C6)
 // ========================================================
 
-// LIVE_LEN: the dashboard plots the last hour, about 120 points at one reading per 30 s; 180 leaves room (v0.12.1, was 720).
+// LIVE_LEN: the dashboard plots the last hour, 60 points at one reading per 60 s (120 at 30 s); 180 leaves room (v0.12.1, was 720).
 static const int MAX_NODES = 8, MAX_SENSORS = 16, LIVE_LEN = 180, DAY_LEN = 288, QUEUE_LEN = 3000, CLIM_LEN = 600, LIGHT_LEN = 600;
 static const int H_SLOTS = 12, DT_LEN = 16;               // health window: 12 x 5 min = the last hour; last 16 reading gaps
 static const uint32_t H_SLOT_MS = 5UL * 60 * 1000;
@@ -1158,7 +1160,7 @@ static void handleSetupPage(const String &msg, bool isErr) {
 #if HUB_I2C_SENSORS
   chk("s_i2c", LS_I2C, "I2C sensors on D4/D5 (SHT40 or AHT20, LTR390; found automatically)");
 #endif
-  b += "<div class=note>The hub reads these like a node, every 30 s, and shows them as one more pot. Leave all unticked for a hub without sensors.</div>";
+  b += "<div class=note>The hub reads these like a node, every 60 s, and shows them as one more pot. Leave all unticked for a hub without sensors.</div>";
   b += "<button>Save and restart</button></form>";
   sendPage(isErr ? 400 : 200, b);
 }

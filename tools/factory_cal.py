@@ -116,13 +116,14 @@ def ask(prompt, auto):
 
 
 def fast(node):
-    """Firmware 0.9+ reads every 30 s to save power. FAST switches it to 5 s for 5 minutes, starting after
-    the reading that's already scheduled (up to 30 s away), so wait that one out: what follows comes every 5 s.
-    Older nodes answer "ERR unknown command" and already run at 5 s."""
+    """Firmware 0.9+ reads every 30 s (0.13+: every 60 s) to save power. FAST switches it to 5 s for 5 minutes.
+    Node 0.13+ brings the next reading forward to within 5 s; 0.9 to 0.12 and the hub's own sensors start after
+    the reading that's already scheduled (up to 60 s away). Either way, wait for that one: what follows comes
+    every 5 s. Older nodes answer "ERR unknown command" and already run at 5 s."""
     reply = node.command("FAST", r"^(FAST|ERR)", 3)
     if reply and reply.startswith("FAST"):
-        print("  waiting for the node to switch to 5 s readings (up to 30 s)...")
-        node.readings(1, 35)
+        print("  waiting for the node to switch to 5 s readings (up to 60 s)...")
+        node.readings(1, 65)
 
 
 def run_unit(port, args):

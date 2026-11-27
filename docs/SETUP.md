@@ -1,7 +1,7 @@
-# GROUNDWELL v0.12: factory-calibrated nodes, soil, air, light and UV at the plant, sensors on the hub too, a 0-100 health score, cloud history
+# GROUNDWELL v0.13: factory-calibrated nodes, soil, air, light and UV at the plant, sensors on the hub too, a 0-100 health score, cloud history
 
 ```
-[XIAO nRF52840 node] --Bluetooth, every 30 s--> [XIAO ESP32-C6 hub] --HTTPS, every 60 s--> [Cloudflare Worker + D1]
+[XIAO nRF52840 node] --Bluetooth, every 60 s--> [XIAO ESP32-C6 hub] --HTTPS, every 60 s--> [Cloudflare Worker + D1]
   capacitive probe                               live dashboard on Wi-Fi                     history dashboard + CSV
                                                  names, calibration                          health score, every hour in the background
                                                  its own probe, air + light (optional)
@@ -10,7 +10,16 @@
   LTR390 / VEML7700 / GL5539 light, LTR390 UV                                                air + light history, once a minute
 ```
 
-**Versions:** node firmware v0.12.0 (XIAO and the Nano ESP32 test node), hub firmware v0.12.1 (the hub updates its nodes for you, section 6; diagnostics and health checks, section 5; sensors on the hub, section 4b), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
+**Versions:** node firmware v0.13.0 (XIAO and the Nano ESP32 test node), hub firmware v0.13.0 (the hub updates its nodes for you, section 6; diagnostics and health checks, section 5; sensors on the hub, section 4b), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
+
+**New in v0.13 (node and hub): ready for a battery**
+- **One reading a minute.** The node reads and broadcasts every 60 s instead of 30 s, and the hub expects that. Soil moisture changes over hours, and the cloud already kept one soil reading per minute, so the charts and the health score lose nothing.
+- **The interval was the smaller part of the battery drain.** The node already slept between readings. What ran the battery down was what stays on while it sleeps: the DHT11 (100 to 150 µA on standby) and the XIAO's unused QSPI flash chip (about 20 µA). See "Running on a battery" in section 1 for the estimate.
+- **QSPI flash put to sleep at boot.** Nothing to do: the node sends the chip its deep power-down command on every start.
+- **DHT11 powered from D3.** Move the DHT11's VCC wire from 3V3 to D3 and the node powers it only while reading (about 3.3 s a minute). Left on 3V3 it works exactly as before.
+- **FAST takes effect within 5 s** instead of after the reading already scheduled, so `factory_cal.py` doesn't wait up to a minute per unit.
+- **`SETTLE` serial command:** prints the capacitive probe's output every 10 ms for 500 ms after power-up, so you can measure how long it really needs (the node waits 150 ms; the probe is the biggest cost of each reading).
+- **Update the hub first.** A v0.12 hub expects a reading every 30 s and would flag a v0.13 node's 60 s interval on `/diag`. A v0.13 hub updates its nodes to v0.13 on its own (section 6).
 
 **New in v0.12.1 (hub)**
 - **Crash fix.** The Bluetooth library keeps a copy of every device it hears (phones, watches, TVs, all of them, with addresses that change every few minutes) and never limits that list. The hub only emptied it at each cloud upload, and not at all while Wi-Fi was down or uploads were off, so in a busy room the list grew until an allocation on the Bluetooth task failed and the hub restarted (`abort()` on `nimble_host`). v0.12.0 had less free memory than v0.11.1 and hit this within minutes: it crashed three times on trial and rolled back. The list is now emptied every 10 s, whatever else the hub is doing.
@@ -56,7 +65,7 @@
 
 | Folder | What it is |
 |---|---|
-| `node/GroundwellNode` | Arduino sketch for the XIAO nRF52840: reads both probes, air and light (and UV with an LTR390), broadcasts a BTHome v2 packet every 30 s |
+| `node/GroundwellNode` | Arduino sketch for the XIAO nRF52840: reads both probes, air and light (and UV with an LTR390), broadcasts a BTHome v2 packet every 60 s |
 | `hub/GroundwellHub` | Arduino sketch for the XIAO ESP32-C6: hears the nodes, serves the live dashboard, uploads to the cloud |
 | `cloud` | Cloudflare Worker + D1 database: stores every reading, scores every pot, serves the dashboard and CSV export |
 | `docs` | `HEALTH_ENGINE.md`: how the score, diagnoses and schedule are worked out, with sources |
@@ -77,7 +86,7 @@ The capacitive probe, the DHT11 and the light sensor go on one XIAO nRF52840. (T
 | Capacitive: red (VCC) | D1 | Powered only for 150 ms per reading |
 | Capacitive: yellow (AOUT) | D0 / A0 | |
 | DHT11 S / DATA | D6 | Module labels vary; follow the printing on yours |
-| DHT11 + / VCC | 3V3 | |
+| DHT11 + / VCC | D3 | Powered only while reading (v0.13). 3V3 also works, always on |
 | DHT11 - / GND | GND | |
 | Photoresistor leg 1 | D7 | Powered only for a few ms per reading. Either leg |
 | Photoresistor leg 2 | D5 / A5 | |
@@ -89,13 +98,14 @@ The capacitive probe, the DHT11 and the light sensor go on one XIAO nRF52840. (T
    cap VCC ---- D1
    cap AOUT --- D0/A0
    DHT DATA --- D6
-   DHT VCC ---- 3V3
+   DHT VCC ---- D3
    DHT GND ---- GND
    LDR leg 1 -- D7
    LDR leg 2 -- D5/A5 ---[1k]--- GND
 ```
 
 - **Coming from an earlier build with rods:** unplug the rod probe and its 10 kOhm resistor (D2, D3, D4). Nothing else moves.
+- **Going to battery (v0.13):** move the DHT11's VCC wire from 3V3 to D3. That's the only wiring change, and it's optional: on 3V3 the node works as before but draws about 3 times more on average.
 - **Coming from the v0.3 / soil-and-air build:** move the DHT11 data wire from D5 to D6, then add the photoresistor and its 1 kOhm resistor.
 - **Photoresistor placement:** face it up at leaf height, where nothing shades it. Under a translucent cap it reads low.
 - **Photoresistor resistor:** 1 kOhm spreads the readings evenly from about 10 to 100,000 lux. A 10 kOhm works, but its readings bunch up above about 10,000 lux; if you use one, set `LDR_FIXED_OHMS` to 10000.
@@ -103,9 +113,35 @@ The capacitive probe, the DHT11 and the light sensor go on one XIAO nRF52840. (T
 - **Leaves over the sensor:** the node sits low in the pot, so leaves shade the sensor and the plant's leaves get more light than it reads. The dashboard handles this: set the sensor position once, or run the leaf-level light check (section 5).
 
 - **DHT11 placement:** mount it about 10 cm above the soil, out of direct sun and away from watering splash. That way it measures the air the leaves sit in, not the damp soil surface. The DHT11 isn't waterproof.
-- **Bare DHT11:** if yours is the bare 4-pin sensor rather than a 3-pin module, add a 10 kOhm pull-up from DATA to 3V3. The module board already has one.
+- **Bare DHT11:** if yours is the bare 4-pin sensor rather than a 3-pin module, add a 10 kOhm pull-up from DATA to the same pin as its VCC (D3, or 3V3 if you keep it there). The module board already has one, to its own VCC pin. Never pull DATA up to 3V3 while VCC is on D3: the sensor would draw power through its data pin.
 - **Capacitive probe check:** the timer chip on the probe should be marked **TLC555**. An NE555 misbehaves at 3.3 V.
-- **Power:** USB-C or a battery; the node runs the same low-power cycle on both. Reading every 30 s, the average draw is dominated by the capacitive probe (about 5 mA for 150 ms per reading) and, if fitted, the DHT11's standby current; an SHT40 in its place idles at about 0.1 µA. If you ever fit a coin cell to the BAT pads, take it out before plugging in USB, because the XIAO's charger would try to charge it.
+- **Power:** USB-C or a battery; the node runs the same low-power cycle on both. See "Running on a battery" below. If you ever fit a coin cell to the BAT pads, take it out before plugging in USB, because the XIAO's charger would try to charge it.
+
+### Running on a battery (v0.13)
+
+The node sleeps between readings. A rough budget, from datasheet and published figures, not yet measured on our boards:
+
+| Where the charge goes | Estimate |
+|---|---|
+| Capacitive probe, about 5 mA for 150 ms | 750 µC per reading |
+| Radio burst, 24 adverts at +4 dBm | about 700 µC per reading |
+| CPU awake, ADC, DHT11 bit timing | about 50 µC per reading |
+| DHT11 on 3V3, standby | 100 to 150 µA, all the time |
+| QSPI flash chip, standby (v0.12 and older) | about 20 µA, all the time |
+| nRF52840 asleep with its clock, plus the XIAO's regulator | about 4 µA, all the time |
+
+| Setup | Average | CR2450 (about 500 mAh usable) | 400 mAh LiPo |
+|---|---|---|---|
+| v0.12: every 30 s, DHT11 on 3V3 | about 200 µA | about 3.5 months | about 2.5 months |
+| v0.13 with the DHT11 still on 3V3 | about 155 µA | about 4.5 months | about 3.5 months |
+| v0.13 with the DHT11 on D3 | about 45 µA | about 15 months | about 11 months |
+| v0.13 with an SHT40 and VEML7700 instead (section 1b) | about 30 µA | about 22 months | about 17 months |
+
+- **Which battery for the prototype:** a small LiPo on the BAT pads is the easy next step. The XIAO charges it over USB-C, and its regulator holds the rail at 3.3 V for most of the discharge, so the DHT11 stays in spec and the factory calibration (taken at 3.3 V on USB) still holds. A CR2450 gives about 3.0 V, sags under the probe's 5 mA, and puts the DHT11 below its 3.0 to 3.3 V minimum, so pair a coin cell with the SHT40 and fit a 100 to 470 µF low-leakage capacitor across it.
+- **Battery level on a LiPo:** the node reports its 3.3 V rail, which stays flat until the LiPo is nearly empty. Reading the LiPo itself needs the XIAO's battery divider (a later firmware change). On a coin cell the rail follows the cell, so the reported voltage works as is.
+- **Measure it:** a Nordic Power Profiler Kit II in source mode, feeding 3.0 to 3.7 V into the BAT pads with USB unplugged, shows the sleep floor and the charge of each reading. Expect a few µA between readings with the DHT11 on D3; tens of µA means something is still powered.
+- **Check the readings on battery:** probe in water should still read about 100%, in air about 0%. For the DHT11 on D3, watch the serial line: `air 23.5 C 47%RH (1st 23.4 C 47%)` shows both reads. If the first always matches, set `DHT_SECOND_MS` to 0 and it stays on 1.2 s a minute instead of 3.3 s.
+- **Next savings, in order:** the probe's settle time (run `SETTLE`; if it settles well before 150 ms, shorten `CAP_SETTLE_MS` and recalibrate), a shorter radio burst (if `/diag` shows well over 5 copies heard per reading, `ADV_BURST_S` 3 halves the radio), and the 10-minute product interval.
 
 ## 1b. Optional: I2C sensors (SHT40, AHT20, LTR390, VEML7700)
 
@@ -134,9 +170,9 @@ At boot the node looks for each sensor and uses the best one it finds: SHT4x (0x
 3. **Install the libraries:** Tools > Manage Libraries:
    - **"DHT sensor library"** by Adafruit, with its "Adafruit Unified Sensor" dependency
 4. **Select the board:** Tools > Board > **Seeed XIAO nRF52840**.
-5. **Upload** `node/GroundwellNode`. Serial Monitor (115200) prints its address and a line every 30 s, for example:
-   `#12 dt=30000ms  capacitive 2873 (uncal)  air 23.5 C 47%RH  light 9258 lux (adc 3108)  VDD 3.30 V`
-   - `dt` is the time since the last reading and should always be about 30000. Type `FAST` for 5 s readings over the next 5 minutes. After factory calibration (section 2b) the capacitive part reads like `capacitive 2283 =  49.9%`.
+5. **Upload** `node/GroundwellNode`. Serial Monitor (115200) prints its address and a line every 60 s, for example:
+   `#12 dt=60000ms  capacitive 2873 (uncal)  air 23.5 C 47%RH (1st 23.4 C 47%)  light 9258 lux (adc 3108)  VDD 3.30 V`
+   - `dt` is the time since the last reading and should always be about 60000. Type `FAST` for 5 s readings over the next 5 minutes (the first comes within 5 s). The `(1st ...)` part is the DHT11's first read after power-up (section 1, "Running on a battery"). After factory calibration (section 2b) the capacitive part reads like `capacitive 2283 =  49.9%`.
    - The flash storage for calibration (LittleFS) comes with the Seeed nRF52 core; there's nothing extra to install.
    - If the air sensor isn't answering, the line says `air: dht11 read failed`. The soil readings still go out. A reading the glitch filter holds back shows as `held (jump)`.
    - Photoresistor: cover it with your hand and the adc number should fall toward 0; shine a phone torch on it and it should rise toward 4000. A steady `light 0 lux (adc 0)` in a lit room means a loose leg or a missing 1 kOhm.
@@ -264,7 +300,7 @@ The first v0.9.1 flash goes over USB. After that, updates go over Wi-Fi (section
 
 ## 4b. Optional: sensors on the hub
 
-The hub can be a pot too. Wire a capacitive probe (and, if you like, a DHT11 and a photoresistor) straight to the hub's XIAO ESP32-C6, the same way as on a node. The hub reads them every 30 s with the node's own code, and they show up as one more pot, "wired to this hub", on the hub page, the cloud dashboard and `/diag`. It keeps listening for its nodes and uploading at the same time.
+The hub can be a pot too. Wire a capacitive probe (and, if you like, a DHT11 and a photoresistor) straight to the hub's XIAO ESP32-C6, the same way as on a node. The hub reads them every 60 s with the node's own code, and they show up as one more pot, "wired to this hub", on the hub page, the cloud dashboard and `/diag`. It keeps listening for its nodes and uploading at the same time.
 
 ![Hub wiring](hub-wiring.svg)
 
@@ -298,7 +334,7 @@ The hub can be a pot too. Wire a capacitive probe (and, if you like, a DHT11 and
 1. **Wire it** as above. Power stays USB-C. Use the TLC555 capacitive probe (an NE555 misbehaves at 3.3 V), and a 10 kOhm pull-up from DATA to 3V3 if your DHT11 is the bare 4-pin part.
 2. **Turn it on:** `http://plants.local/setup` > **Sensors wired to this hub**. Tick the capacitive probe (that switches the hub's sensors on), then what else you fitted: DHT11, photoresistor, I2C. Save; the hub restarts. I2C sensors are found at start, so restart the hub after adding one.
 3. **Factory-calibrate the probe** over USB, exactly like a node (section 2b): `python factory_cal.py --operator BN`. The script finds the hub and says `Hub ...`. Until then the card shows the raw count, and `/diag` says it isn't calibrated.
-4. **Check it:** Serial Monitor prints the same reading line as a node every 30 s (`#12 dt=30000ms  capacitive 2283 =  49.9%  air 23.5 C 47%RH  light 9258 lux (adc 3108)  VDD 3.30 V`), and `/diag` shows a "Sensors wired to this hub" card and a row in the node table.
+4. **Check it:** Serial Monitor prints the same reading line as a node every 60 s (`#12 dt=60000ms  capacitive 2283 =  49.9%  air 23.5 C 47%RH  light 9258 lux (adc 3108)  VDD 3.30 V`), and `/diag` shows a "Sensors wired to this hub" card and a row in the node table.
 
 - **Keep the air sensor away from the board.** The hub's ESP32 runs warm with Wi-Fi and Bluetooth on, a few degrees above the room. Put the DHT11 or SHT40 on a lead about 10 cm long, at leaf height, so it measures the plant's air and not the hub. The same goes for the hub's enclosure: let the sensor sit outside it.
 - **The light sensor** sees what the hub sees: put the photoresistor (or LTR390) on a lead at leaf height, facing up.
@@ -320,7 +356,7 @@ What it checks, per node, over the last hour (so a problem from this morning doe
 
 | Check | Healthy | Needs attention | Problem |
 |---|---|---|---|
-| Readings received vs expected (one per 30 s) | 95% or more | 80 to 95% | under 80%, or offline |
+| Readings received vs expected (one per 60 s) | 95% or more | 80 to 95% | under 80%, or offline |
 | Dropped readings (gaps in the packet id) | under 1% | 1 to 5% | over 5% |
 | Timing: middle of the last 16 gaps between readings | within 10% of the expected interval | 10 to 25% off, a gap long enough to miss readings, or two readings too close | over 25% off |
 | Copies heard of each reading (a burst sends 24) | 5 or more | 2 to 5: thin link margin | under 2: at the edge of range |
@@ -403,7 +439,7 @@ Each node (pot) gets its own panel. Pick the plant from the dropdown (20 common 
 | Probe names, calibration, latest status | Always current | Cards |
 
 - **Re-sent batches:** if the hub retries an upload after a lost response, the duplicates are ignored, so nothing double-counts.
-- **Offline buffering:** while Wi-Fi or the internet is down, the hub queues up to 3,000 readings (about 12 hours at 30 s with two probes) and sends them when it reconnects.
+- **Offline buffering:** while Wi-Fi or the internet is down, the hub queues up to 3,000 readings (about a day at 60 s with two probes) and sends them when it reconnects.
 
 ### Free-tier limits (v0.9)
 
@@ -451,7 +487,7 @@ Firmware files come from the GitHub build: every push to `groundwell-firmware` b
 
 The hub carries the node firmware inside its own. Update the hub and it brings every node up to the same version over Bluetooth, one node at a time.
 
-- **What happens:** about a minute after the hub starts, it checks each node during one of its 30-second bursts. A node on older firmware gets the new one: it hands over to its bootloader, the hub sends the file (1 to 2 minutes), and the node restarts with its calibration intact. After that the hub checks each node once a day.
+- **What happens:** about a minute after the hub starts, it checks each node during one of its bursts (one a minute). A node on older firmware gets the new one: it hands over to its bootloader, the hub sends the file (1 to 2 minutes), and the node restarts with its calibration intact. After that the hub checks each node once a day.
 - **Linking:** a node only accepts updates from the hub it's linked to. A node links to the hub that reaches it in the **10 minutes after its power-up or a reset**; the hub does this on its own. A node linked to another hub, or never linked, shows "press its reset button": press it once and the hub links it within a minute.
 - **Battery:** the hub only updates a node whose battery reads 2.7 V or more; otherwise the update waits.
 - **Where to watch:** `http://plants.local/update` has a **Nodes** table (firmware and status for each). The Admin view of the dashboard shows the same on each card. Serial Monitor on the hub prints every step as `Node EE:FF: ...`.
@@ -465,6 +501,7 @@ Still works, for a node the hub can't reach: press its reset button once, then i
 
 ## Verified before release
 
+- **v0.13 node and hub:** the host tests and the shared-code check pass, and the GitHub build compiles the XIAO node, both Nano ESP32 test-node packages and the hub (with the node firmware inside) against the real board packages. Not yet run on hardware: the QSPI flash command, the DHT11 on D3 and the battery figures above need a bench check ("Running on a battery").
 - **v0.12 hub, compiled against the real ESP32 core** (esp32 3.3.13, board XIAO_ESP32C6, the two-slot size limit): no new warnings (the 6 it prints were in v0.11.1 too). 1,792,555 bytes without the node firmware; with a 160 KB stand-in node firmware bundled, 1,956,469 of 1,966,080 bytes, so a node firmware up to about 169 KB fits. The rollback test build fits too. With a 185 KB stand-in, the GitHub build's fallback leaves the I2C sensors out and lands at about 1,951,000 bytes.
 - **v0.12 node, compiled against the real ESP32 core** as the Nano ESP32 test node, in both light modes, with no warnings. The XIAO nRF52840 build needs the Seeed core, which couldn't be downloaded here: the GitHub build compiles it on every push.
 - **Shared code:** `tools/check_shared_code.py` confirms the hub's `local_sensors.h` carries the node's capacitive probe, I2C sensor, DHT11, photoresistor, calibration and packet code word for word, and fails when one character differs (tested). The GitHub build runs it.
