@@ -130,6 +130,7 @@ function nodeHealth(n,d){
   if(g.cal==='0')add(1,'Not factory calibrated: sends raw counts','Run tools/factory_cal.py on it.');
   if(!loc&&g.link==='0')add(1,'Not linked to a hub','Press its reset button; the hub links it within a minute.');
   if(+g.authfail>0)add(g.link==='1'&&/linked to this hub|up to date|updat/.test(n.st||'')?-1:1,g.authfail+' refused link-key proof'+(+g.authfail>1?'s':'')+' since it started','It holds a key this hub can\'t prove: another hub linked it, or this hub\'s key changed. Press its reset button: in the 10 minutes after, this hub writes its own key.');
+  if(+g.rwerr>0)add(2,g.rwerr+' Bluetooth replies the node failed to send','The node couldn\'t answer a write: the hub sees "no reply". Send a snapshot.');
   if(/watchdog|lockup/.test(g.rst||''))add(1,'It last restarted from a '+g.rst,'A hang on the node: download a snapshot and report it.');
   if(g.air&&g.air!='none'&&(n.airS<0||n.airS>5*exp)&&N>=4&&af<N-1)add(1,'No air reading has reached the hub '+(n.airS<0?'yet':'for '+mins(n.airS)),'Readings are being held back as glitches: check the air sensor.');
  }
