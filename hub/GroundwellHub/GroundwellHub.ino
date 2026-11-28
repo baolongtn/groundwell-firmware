@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL hub v0.13.1
+  GROUNDWELL hub v0.13.2
   Board: Seeed XIAO ESP32-C6, Arduino core "esp32 by Espressif Systems" 3.x (NOT 4.x: it replaced the BLE API),
          board "XIAO_ESP32C6", Tools > Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)".
          The menu only sets the IDE's size check: partitions.csv in this folder replaces the layout with two
@@ -79,6 +79,9 @@
       node look offline "for 50 days".
     - v0.13.1 carries node 0.13.1, which answers the writes it accepts (the real cause of "key write got no
       reply"). A link step that loses the connection now says so instead of "refused".
+    - v0.13.2 carries node 0.13.2, which reads the whole key and proof (the cause of "proof was refused"). A node
+      that can't complete a link but is in its window (just reset) and on older firmware is updated anyway, the
+      way a phone would: the node allows that in its window. It links after it restarts on the new firmware.
     - Probe names and calibration set on the cloud dashboard (Admin > Calibrate) come back in the
       upload reply and are applied and saved here, as if set on this page (v0.6.2).
 
@@ -143,9 +146,9 @@
   #define GW_CRASH_TEST 0      // 1 = rollback test build: crashes 20 s after every boot (the GitHub build makes one)
 #endif
 #if GW_CRASH_TEST
-  #define GW_FW_VERSION "0.13.1-crashtest"
+  #define GW_FW_VERSION "0.13.2-crashtest"
 #else
-  #define GW_FW_VERSION "0.13.1"
+  #define GW_FW_VERSION "0.13.2"
 #endif
 static const char *FW_VERSION = GW_FW_VERSION;
 // Optional secrets.h (git-ignored): WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY and optionally OTA_PASS.
@@ -1533,14 +1536,19 @@ static uint32_t nodeCheck(int i, const char *mac, uint8_t type, float volt, bool
       }
     }
     bool proven = (linked || wrote) && nodeAuth(gw);
-    if (!proven) {
+    // In its window the node accepts an update without a proof, as from a phone. So a node whose firmware can't
+    // finish a link (before 0.13.2 its key and proof arrived cut short) is still brought up to date, and links
+    // on a later check, after it restarts on the new firmware (v0.13.2).
+    bool windowUpdate = !proven && window && NODE_FW_BUNDLED && dfuVersionCompare(NODE_FW_VERSION, ver.c_str()) > 0;
+    if (windowUpdate) logEvent("Node %s: can't link yet (proof %s); updating it in its window", mac + 9, authWhy);
+    if (!proven && !windowUpdate) {
       nodeDisconnect();
       if (wrote) nodeStatus(i, "linking failed: key written, but its proof %s", authWhy);
       else if (linked) nodeStatus(i, "linked to another hub (proof %s): press its reset button", authWhy);
       else nodeStatus(i, "not linked: press its reset button");
       return wrote ? 120000 : 3600000;
     }
-    if (wrote) {                                   // linked: update on a later connection, once the node has saved the key
+    if (proven && wrote) {                         // linked: update on a later connection, once the node has saved the key
       nodes[i].linkedAt = millis() | 1;
       nodeDisconnect();
       nodeStatus(i, "linked to this hub");

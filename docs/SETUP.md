@@ -10,9 +10,13 @@
   LTR390 / VEML7700 / GL5539 light, LTR390 UV                                                air + light history, once a minute
 ```
 
-**Versions:** node firmware v0.13.1 (XIAO and the Nano ESP32 test node), hub firmware v0.13.1 (the hub updates its nodes for you, section 6; diagnostics and health checks, section 5; sensors on the hub, section 4b), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
+**Versions:** node firmware v0.13.2 (XIAO and the Nano ESP32 test node), hub firmware v0.13.2 (the hub updates its nodes for you, section 6; diagnostics and health checks, section 5; sensors on the hub, section 4b), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
 
-**New in v0.13.1 (node and hub): linking works**
+**New in v0.13.2 (node and hub): the second link bug**
+- **"key written, but its proof was refused".** With the reply fixed in v0.13.1, the next step failed. The node's Bluetooth library (Bluefruit) runs a write-authorize callback later by default, and hands it a copy of the write that stops after the first data byte. So the node saved a link key that was all but one byte garbage, and checked every proof against garbage. The node now runs those callbacks on the Bluetooth event itself, with the whole 16 bytes.
+- **No USB flash needed this time.** In a node's window (the 10 minutes after a reset) the node accepts an update without a key, as from a phone. The v0.13.2 hub uses that: when a node in its window can't finish a link and runs older firmware, the hub updates it anyway. The node restarts on 0.13.2, and the hub links it on its next check.
+
+**New in v0.13.1 (node and hub): the first link bug**
 - **The real cause of "key write got no reply in 30 s" was on the node.** When the node accepts a Bluetooth write that waits for its approval (the hub's link key, a correct key proof, the update start), it must hand the written data back in its reply. The SoftDevice API says that bit "must always be set" for writes. The node left it out, so the SoftDevice rejected the reply, nothing went out, and the hub waited 30 s. Refusals were answered fine, which is why only links that should have worked failed, on every node firmware since 0.10.
 - **One last USB flash per node.** A node on 0.13.0 or older can't link, so the hub can't update it. Flash each XIAO node once by USB: double-tap its reset button and drag `GroundwellNode.uf2` from the GitHub build onto the drive that appears. Then press reset once next to the hub, and it links. From then on the hub updates it over Bluetooth.
 - **Clearer link messages (hub):** a link step that loses the connection says "connection dropped ... move it closer" instead of "refused". The node reports replies the SoftDevice rejects (`rwerr`), and `/diag` flags them.

@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL sensor node v0.13.1  (capacitive soil probe + air temperature/humidity + light + UV, one board)
+  GROUNDWELL sensor node v0.13.2  (capacitive soil probe + air temperature/humidity + light + UV, one board)
   Board:  Seeed XIAO nRF52840 (plain or Sense)
           Arduino IDE: Boards Manager URL
             https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
@@ -28,6 +28,10 @@
   left out the written data, which the SoftDevice requires, so the reply was never sent and the hub waited 30 s:
   "key write got no reply in 30 s". Refusals were answered, which is why only a link that should succeed failed.
   A reply the SoftDevice rejects now counts in the node's self-report (rwerr).
+  v0.13.2: the link key and key proof arrive whole. Bluefruit runs a write-authorize callback later, on its
+  callback task, by default, and hands it a copy of the write that stops after the first data byte. So the node
+  saved a key that was all but one byte garbage, and checked every proof against garbage: "proof was refused".
+  The link callbacks now run at once, on the Bluetooth event itself, with the full data.
   Diagnostics (v0.11): a read-only characteristic reports uptime, why it last restarted, readings sent,
   air-sensor read failures, sensors, calibration, link, update window, radio power, interval, connections
   and failed link-key attempts. The hub reads it at each check and shows it on http://plants.local/diag.
@@ -121,7 +125,7 @@
       I2C sensors  (LIGHT_I2C) SDA -> A4, SCL -> A5
 */
 
-static const char *FW_VERSION = "0.13.1";
+static const char *FW_VERSION = "0.13.2";
 
 // ---------------- light sensor choice ----------------
 #define LIGHT_LDR      1                         // GL5539 photoresistor + DHT11, no I2C (the parts in hand)
@@ -1060,9 +1064,11 @@ static void beginLinkServices() {
   gwInfo.setProperties(CHR_PROPS_READ);   gwInfo.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);  gwInfo.setMaxLen(40); gwInfo.begin();
   gwNonce.setProperties(CHR_PROPS_READ);  gwNonce.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS); gwNonce.setFixedLen(16); gwNonce.begin();
   gwAuth.setProperties(CHR_PROPS_WRITE);  gwAuth.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);  gwAuth.setFixedLen(16);
-  gwAuth.setWriteAuthorizeCallback(authWriteCb); gwAuth.begin();
+  // false: run the callback on the event itself. Deferred (the default), Bluefruit copies the write only up to
+  // its first data byte, and the key and proof are 16 bytes (v0.13.2).
+  gwAuth.setWriteAuthorizeCallback(authWriteCb, false); gwAuth.begin();
   gwKey.setProperties(CHR_PROPS_WRITE);   gwKey.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);   gwKey.setFixedLen(16);
-  gwKey.setWriteAuthorizeCallback(keyWriteCb); gwKey.begin();
+  gwKey.setWriteAuthorizeCallback(keyWriteCb, false); gwKey.begin();
   gwDiag.setProperties(CHR_PROPS_READ);   gwDiag.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);  gwDiag.setMaxLen(160); gwDiag.begin();
 
   dfuSvc.begin();
