@@ -103,9 +103,12 @@ function nodeHealth(n,d){
   if(mx>1.9*exp)add(1,'Longest gap '+mx.toFixed(0)+' s, about '+Math.round(mx/exp-1)+' readings missed',loc?'The hub was busy or restarting.':'See dropped readings and the link checks.');
  }
  const win=Math.min(E.hourS,n.firstS>=0?n.firstS:0),expN=win/exp,got=n.hRx,lost=n.hLost;
+ // Percentages need enough readings to mean something (v0.12.2): under 20 expected, a miss or two is only a note.
+ const few=expN<20,sure=(l)=>few?Math.min(l,got+lost>=6&&lost>=3?1:-1):l;
  if(expN>=4){const p=100*got/expN,t='Received '+got+' of about '+Math.round(expN)+' readings in the last '+mins(win)+' ('+Math.min(100,Math.round(p))+'%)';
-  if(p<80)add(2,t,loc?'Hub sensor readings are going missing: download a snapshot.':'Readings are going missing: weak link (below), a flat battery, or the node restarting.');else if(p<95)add(1,t,'A few readings missing: watch the link checks.')}
- if(lost){const lp=100*lost/(got+lost);add(lp>5?2:lp>1?1:-1,lost+' readings dropped in the last '+mins(win)+' ('+lp.toFixed(1)+'%)','Packets the hub never heard. Move the node or hub closer, raise TX_POWER_DBM to 8 on the node, or fit the hub\'s external antenna.')}
+  if(p<80)add(sure(2),t,loc?'Hub sensor readings are going missing: download a snapshot.':'Readings are going missing: weak link (below), a flat battery, or the node restarting.');else if(p<95)add(sure(1),t,'A few readings missing: watch the link checks.')}
+ if(lost){const lp=100*lost/(got+lost);add(sure(lp>5?2:lp>1?1:-1),lost+' reading'+(lost>1?'s':'')+' dropped in the last '+mins(win)+' ('+lp.toFixed(1)+'%)'+(few?', early days':''),'Packets the hub never heard. Move the node or hub closer, raise TX_POWER_DBM to 8 on the node, or fit the hub\'s external antenna.')}
+ if(n.hStale)add(n.hStale>got?1:-1,n.hStale+' old packet'+(n.hStale>1?'s':'')+' heard late in the last '+mins(win)+' (not counted as readings)','Normal for a node in its link window, which advertises nonstop. Outside the window it points at a radio repeating itself: worth a reset.');
  if(!loc&&got>=3){
   const cp=n.hAdv/got;
   if(cp<2)add(2,'Only '+cp.toFixed(1)+' copies of each reading heard (a burst sends '+E.copies+')','The link is at its edge: one more wall and readings drop. Move the node or hub closer, or raise TX_POWER_DBM.');
@@ -126,7 +129,7 @@ function nodeHealth(n,d){
   if(g.air&&g.air!='none'&&N>=4){if(af>=N-1)add(2,'Air sensor ('+g.air+') not answering','Check its DATA, + and - wires; a bare 4-pin DHT11 needs a 10 kOhm pull-up to 3V3.');else if(af/N>.1)add(1,'Air sensor fails '+Math.round(100*af/N)+'% of reads','A DHT11 does this near radios; an SHT40 on I2C is steadier.')}
   if(g.cal==='0')add(1,'Not factory calibrated: sends raw counts','Run tools/factory_cal.py on it.');
   if(!loc&&g.link==='0')add(1,'Not linked to a hub','Press its reset button; the hub links it within a minute.');
-  if(+g.authfail>0)add(1,g.authfail+' failed link-key attempts','Another hub or a phone tried to update it.');
+  if(+g.authfail>0)add(g.link==='1'&&/linked to this hub|up to date|updat/.test(n.st||'')?-1:1,g.authfail+' refused link-key proof'+(+g.authfail>1?'s':'')+' since it started','It holds a key this hub can\'t prove: another hub linked it, or this hub\'s key changed. Press its reset button: in the 10 minutes after, this hub writes its own key.');
   if(/watchdog|lockup/.test(g.rst||''))add(1,'It last restarted from a '+g.rst,'A hang on the node: download a snapshot and report it.');
   if(g.air&&g.air!='none'&&(n.airS<0||n.airS>5*exp)&&N>=4&&af<N-1)add(1,'No air reading has reached the hub '+(n.airS<0?'yet':'for '+mins(n.airS)),'Readings are being held back as glitches: check the air sensor.');
  }
@@ -239,7 +242,7 @@ function render(d){
   t+='<tr><td><span class=mono>'+esc(n.mac)+'</span><div class=small>'+esc(n.type)+(n.conn?', connectable':'')+'<br>'+esc(n.probes)+'</div></td>'+
    '<td>'+ld(r.l)+(r.l==2?'problem':r.l==1?'needs attention':'healthy')+(top?'<div class=small>'+esc(top.what)+'</div>':'')+'</td>'+
    '<td>'+dot(n.online)+(n.online?'online':'offline')+'<div class=small>heard '+ago(n.seenS)+'<br>new reading '+ago(n.freshS)+'<br>first heard '+ago(n.firstS)+(n.cloudS>=0?'<br>in the cloud '+ago(n.cloudS):'')+'</div></td>'+
-   '<td>'+(r.expN>=1?n.hRx+' of ~'+Math.round(r.expN):n.hRx)+' readings<div class=small>'+n.hLost+' dropped'+(n.local?'':'<br>'+(n.hRx?(n.hAdv/n.hRx).toFixed(1):'?')+' copies heard each')+'<br>since start: '+n.rx+' in, '+n.lost+' lost ('+(n.lossX10/10).toFixed(1)+'%)</div></td>'+
+   '<td>'+(r.expN>=1?n.hRx+' of ~'+Math.round(r.expN):n.hRx)+' readings<div class=small>'+n.hLost+' dropped'+(n.hStale?', '+n.hStale+' old':'')+(n.local?'':'<br>'+(n.hRx?(n.hAdv/n.hRx).toFixed(1):'?')+' copies heard each')+'<br>since start: '+n.rx+' in, '+n.lost+' lost ('+(n.lossX10/10).toFixed(1)+'%)</div></td>'+
    '<td>'+(n.dtN?r.med.toFixed(1)+' s':'?')+'<div class=small>expected '+r.exp+' s'+(n.dtN?'<br>range '+r.mn.toFixed(1)+' to '+r.mx.toFixed(1)+' s<br>last '+(n.dtLast/1000).toFixed(1)+' s':'')+'</div></td>'+
    '<td>'+(n.local?'wired':n.hRssi+' dBm')+(n.local?'':'<div class=small>avg, last hour<br>'+n.rssiMin+' to '+n.rssiMax+' since start</div>')+'</td>'+
    '<td>'+(n.local?'USB':n.mv?(n.mv/1000).toFixed(2)+' V':'?')+'<div class=small>'+(n.air?'air ':'')+(n.lux?'light ':'')+(n.uvOk?'UV':'')+'</div></td>'+
