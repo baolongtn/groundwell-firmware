@@ -259,7 +259,7 @@ static volatile bool keyOk = false;                  // stays false on the ESP32
 static float lastVdd = 0;
 static SemaphoreHandle_t wakeSem;                    // lets a Bluetooth event wake the main loop early
 // Diagnostics (v0.11)
-static uint32_t readings = 0, airFails = 0, connects = 0, authFails = 0;
+static uint32_t readings = 0, airFails = 0, connects = 0, authFails = 0, replyErrs = 0;   // replyErrs: v0.13.1
 static uint32_t fastUntil = 0;                        // FAST command: 5 s readings until this millis()
 static bool fastKick = false;                         // FAST just arrived: bring the next reading forward (v0.13)
 static uint32_t dhtOnAt = 0;                          // when the DHT11's power pin went high this cycle
@@ -944,7 +944,6 @@ static bool plainWrite(ble_gatts_evt_write_t *r) {
 // Answer a write that waits for our authorization. An accepted write must hand its data back with update set:
 // the SoftDevice API says the bit "must always be set" for writes, and without it the call fails and no reply
 // goes out at all (v0.13.1; before, every accepted key write and key proof left the hub waiting 30 s).
-static uint32_t replyErrs = 0;
 static void replyWrite(uint16_t conn, bool ok, const ble_gatts_evt_write_t *r) {
   ble_gatts_rw_authorize_reply_params_t reply = {.type = BLE_GATTS_AUTHORIZE_TYPE_WRITE};
   reply.params.write.gatt_status = ok ? BLE_GATT_STATUS_SUCCESS : BLE_GATT_STATUS_ATTERR_INSUF_AUTHORIZATION;
