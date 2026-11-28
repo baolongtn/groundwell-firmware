@@ -14,6 +14,9 @@ struct DfuLink {
   virtual bool waitNotify(uint8_t *out, size_t &n, uint32_t ms) = 0;  // next control-point notification
   virtual void drain() {}                                             // forget queued notifications
   virtual void progress(uint32_t done, uint32_t total) { (void)done; (void)total; }
+  // Restart the bootloader (DFU_OP_RESET) and connect to it again; false if that isn't possible or the node came
+  // back on its own firmware instead. Used when a bootloader left mid-update answers START with "wrong state".
+  virtual bool restart() { return false; }
   virtual ~DfuLink() {}
 };
 
@@ -70,12 +73,18 @@ static const char *dfuTransfer(DfuLink &l, const uint8_t *bin, uint32_t len, con
   uint8_t c[3];
   const char *e;
 
-  c[0] = DFU_OP_START; c[1] = DFU_IMAGE_APP;
-  if (!l.writeCtrl(c, 2)) { snprintf(err, errLen, "the node refused the start command"); return err; }
   uint8_t sizes[12] = {0};
   dfuPut32(sizes + 8, len);                                   // softdevice 0, bootloader 0, application len
-  if (!l.writePkt(sizes, sizeof sizes)) { snprintf(err, errLen, "lost the connection sending the size"); return err; }
-  if ((e = dfuExpect(l, DFU_OP_START, 30000, err, errLen))) return e;   // the node erases flash first: a few seconds
+  for (int attempt = 0;; attempt++) {
+    c[0] = DFU_OP_START; c[1] = DFU_IMAGE_APP;
+    if (!l.writeCtrl(c, 2)) { snprintf(err, errLen, "the node refused the start command"); return err; }
+    if (!l.writePkt(sizes, sizeof sizes)) { snprintf(err, errLen, "lost the connection sending the size"); return err; }
+    e = dfuExpect(l, DFU_OP_START, 30000, err, errLen);      // the node erases flash first: a few seconds
+    if (!e) break;
+    // A bootloader left mid-update by an earlier try answers "wrong state" until it restarts (v0.13.3).
+    if (attempt > 0 || !strstr(e, "wrong state") || !l.restart()) return e;
+    l.drain();
+  }
 
   c[0] = DFU_OP_INIT; c[1] = 0;
   if (!l.writeCtrl(c, 2)) { snprintf(err, errLen, "the node refused the init command"); return err; }
