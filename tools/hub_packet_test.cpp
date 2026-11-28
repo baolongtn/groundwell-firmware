@@ -142,6 +142,27 @@ int main() {
   CHECK(hSlots == H_SLOTS);
   CHECK(nodes[a].rx == 300);                              // the since-start counters stay
 
+  // 8. Old copies heard late (v0.12.2): 40, 39 (old), 41 -> 2 readings, 1 old packet, nothing lost, no 0.5 s gap.
+  const char *D = "AA:BB:CC:DD:EE:04";
+  fakeMs += 30000; handlePacket(D, -60, 1, true, pkt(40, true, 0));
+  fakeMs += 500;   handlePacket(D, -60, 1, true, pkt(39, true, 0));
+  fakeMs += 29500; handlePacket(D, -60, 1, true, pkt(41, true, 0));
+  int dn = findNode(D, false);
+  CHECK(nodes[dn].rx == 2 && nodes[dn].stale == 1 && nodes[dn].lost == 0 && nodes[dn].lastPid == 41);
+  CHECK(nodes[dn].dtN == 1 && nodes[dn].dts[0] == 3000);          // one 30 s gap, not 0.5 s + 29.5 s
+  // ... a restart (back to 1) is still a restart, not an old packet ...
+  fakeMs += 30000; handlePacket(D, -60, 1, true, pkt(1, true, 0));
+  CHECK(nodes[dn].restarts == 1 && nodes[dn].stale == 1 && nodes[dn].rx == 3);
+  // ... the normal wrap (2..255, 0, 1) is neither old packets nor a restart ...
+  for (int k = 2; k <= 255; k++) { fakeMs += 30000; handlePacket(D, -60, 1, true, pkt((uint8_t)k, true, 0)); }
+  fakeMs += 30000; handlePacket(D, -60, 1, true, pkt(0, true, 0));
+  fakeMs += 30000; handlePacket(D, -60, 1, true, pkt(1, true, 0));
+  CHECK(nodes[dn].stale == 1 && nodes[dn].restarts == 1 && nodes[dn].lost == 0 && nodes[dn].rx == 259);
+  // ... and a restart whose readings 1 and 2 were missed (3 arrives a minute after 10) is still a reading.
+  for (int k = 2; k <= 10; k++) { fakeMs += 30000; handlePacket(D, -60, 1, true, pkt((uint8_t)k, true, 0)); }
+  fakeMs += 70000; handlePacket(D, -60, 1, true, pkt(3, true, 0));
+  CHECK(nodes[dn].stale == 1 && nodes[dn].rx == 269 && nodes[dn].lastPid == 3);
+
   printf(fails ? "%d FAILURES\n" : "ALL PASS\n", fails);
   return fails ? 1 : 0;
 }

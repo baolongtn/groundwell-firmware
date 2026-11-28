@@ -1,6 +1,6 @@
 // GROUNDWELL hub v0.12.0: sensors wired straight to the hub, read exactly like a node.
 //
-// The hub reads its own probes on the node's schedule (every 30 s; 5 s after FAST), builds the reading with the
+// The hub reads its own probes on the node's schedule (every 60 s; 5 s after FAST), builds the reading with the
 // node's own packet builder, and hands it to the same code that handles Bluetooth packets. So the dashboard,
 // history, cloud upload and diagnostics treat the hub's probes as one more node, shown as "wired".
 // Factory calibration works over USB with the node's serial commands and tools/factory_cal.py.
@@ -42,7 +42,7 @@ static const int PIN_LDR_POWER = D7;
 static const char *I2C_PINS    = "D4/D5";
 
 // ---------------- settings (same values as the node) ----------------
-static const uint32_t REPORT_MS       = 30000; // one reading every 30 s, like a node
+static const uint32_t REPORT_MS       = 60000; // one reading every 60 s, like a node (v0.13)
 static const uint32_t FAST_REPORT_MS  = 5000;  // after a FAST command, for FAST_FOR_MS
 static const uint32_t FAST_FOR_MS     = 300000;
 static const float    AIR_JUMP_C      = 3.0f;  // air readings that jump more than this from the last one ...

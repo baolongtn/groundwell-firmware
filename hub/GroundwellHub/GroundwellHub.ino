@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL hub v0.12.1
+  GROUNDWELL hub v0.13.0
   Board: Seeed XIAO ESP32-C6, Arduino core "esp32 by Espressif Systems" 3.x (NOT 4.x: it replaced the BLE API),
          board "XIAO_ESP32C6", Tools > Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)".
          The menu only sets the IDE's size check: partitions.csv in this folder replaces the layout with two
@@ -24,7 +24,7 @@
       about itself, the probes, and an event log. "Download snapshot" saves it all as one file for debugging.
   Sensors wired to the hub (v0.12)
     - The hub can carry its own sensors, like a node: capacitive probe, DHT11, photoresistor and the I2C
-      sensors (SHT4x, AHT20, LTR390). It reads them every 30 s with the node's own code
+      sensors (SHT4x, AHT20, LTR390). It reads them every 60 s (v0.12: 30 s) with the node's own code
       (local_sensors.h) and they show up as one more node, "wired to this hub". Wiring: local_sensors.h and
       docs/SETUP.md section 4b. Turn them on at /setup ("Sensors wired to this hub").
     - Factory calibration over USB with the node's commands (INFO, CAL AIR, CAL WATER, FAST) and tools/factory_cal.py.
@@ -68,6 +68,15 @@
     - Uploads to the GROUNDWELL cloud service once a minute (v0.9; the cloud keeps one soil reading per probe
       per minute). Readings queue up in RAM if Wi-Fi or the internet drops and are sent when it comes back.
     - v0.9 nodes send a reading every 30 s in a short radio burst (battery profile); v0.6 nodes (every 5 s) still work.
+    - v0.13 nodes send a reading every 60 s, and the hub expects that (NODE_INTERVAL_MS). Nodes on 0.12 or older
+      still work (their extra readings are dropped, and /diag flags their interval) until the hub updates them.
+    - Linking (v0.13, the v0.12.2 fix): in a node's window the hub writes its key first and then proves it. Before,
+      it first tried to prove the key the node already held (another hub's), and the key write after that refused
+      proof failed every time ("linking failed"). Each step is timed, and a failure says which step and how long.
+    - A packet numbered a few readings behind the last one is an old copy heard late, not a new reading: it no
+      longer counts as a reading, a gap or a timing sample.
+    - Ages and online state are worked out with the node table locked, so a packet arriving meanwhile can't make a
+      node look offline "for 50 days".
     - Probe names and calibration set on the cloud dashboard (Admin > Calibrate) come back in the
       upload reply and are applied and saved here, as if set on this page (v0.6.2).
 
@@ -132,9 +141,9 @@
   #define GW_CRASH_TEST 0      // 1 = rollback test build: crashes 20 s after every boot (the GitHub build makes one)
 #endif
 #if GW_CRASH_TEST
-  #define GW_FW_VERSION "0.12.1-crashtest"
+  #define GW_FW_VERSION "0.13.0-crashtest"
 #else
-  #define GW_FW_VERSION "0.12.1"
+  #define GW_FW_VERSION "0.13.0"
 #endif
 static const char *FW_VERSION = GW_FW_VERSION;
 // Optional secrets.h (git-ignored): WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY and optionally OTA_PASS.
@@ -173,10 +182,10 @@ static const char *FW_VERSION = GW_FW_VERSION;
 static const float SOIL_DRY_PS = 30.0f;          // bone-dry potting mix reads about this on the probe scale
 static const float SOIL_WET_PS = 75.0f;          // potting mix just watered and drained
 
-static const uint32_t NODE_INTERVAL_MS = 30000; // must match REPORT_MS on the nodes (v0.9: 30 s; v0.6 nodes send every 5 s and still work)
+static const uint32_t NODE_INTERVAL_MS = 60000; // must match REPORT_MS on the nodes (v0.13: 60 s; v0.9 to v0.12: 30 s; v0.6: 5 s)
 static const uint32_t UPLOAD_MS        = 60000; // one upload a minute keeps Cloudflare D1 well inside its free daily limits
 static const uint32_t DAY_BUCKET_MS    = 5UL * 60 * 1000;
-static const uint32_t STALE_MS         = 150000; // card shows "no signal" after this (5 missed readings)
+static const uint32_t STALE_MS         = 300000; // card shows "no signal" after this (5 missed readings at 60 s)
 static const uint32_t CLIMATE_MS       = 60000; // air temp/humidity and light sent to the cloud once a minute per node
 static const uint32_t WIFI_RETRY_MS    = 30000; // Wi-Fi down this long: start the connection over (rescans, picks any mesh point)
 static const uint32_t WIFI_REBOOT_MS   = 30UL * 60 * 1000;   // still down after this: restart the hub, once per outage
@@ -189,7 +198,7 @@ static const uint32_t SCAN_CLEAR_MS    = 10000;              // empty the Blueto
 static const int      SETUP_BTN_PIN    = BOOT_PIN;           // the BOOT button (GPIO 9 on the ESP32-C6)
 // ========================================================
 
-// LIVE_LEN: the dashboard plots the last hour, about 120 points at one reading per 30 s; 180 leaves room (v0.12.1, was 720).
+// LIVE_LEN: the dashboard plots the last hour, 60 points at one reading per 60 s (120 at 30 s); 180 leaves room (v0.12.1, was 720).
 static const int MAX_NODES = 8, MAX_SENSORS = 16, LIVE_LEN = 180, DAY_LEN = 288, QUEUE_LEN = 3000, CLIM_LEN = 600, LIGHT_LEN = 600;
 static const int H_SLOTS = 12, DT_LEN = 16;               // health window: 12 x 5 min = the last hour; last 16 reading gaps
 static const uint32_t H_SLOT_MS = 5UL * 60 * 1000;
@@ -214,7 +223,7 @@ struct Node {
   uint8_t addrType;              // Bluetooth address type from its adverts (random static for these nodes)
   bool connectable;              // its last advert accepted connections
   char fw[16];                   // firmware version it reported ("" = not checked yet)
-  char st[56];                   // update status for the dashboard
+  char st[88];                   // update status for the dashboard (v0.12.2: longer, for the link messages)
   uint8_t pct;                   // update progress, percent
   bool updating, smallPkts;      // smallPkts: its bootloader only takes 20-byte packets
   uint32_t nextCheckAt;          // millis() of the next check (0 = soon)
@@ -236,6 +245,9 @@ struct Node {
   uint8_t dtHead, dtN;
   uint32_t cloudTs;              // time stamp (epoch) of this node's newest soil reading the cloud accepted
   uint32_t windowAt;             // when it was last seen advertising between bursts (its link window after a reset)
+  uint16_t hStale[H_SLOTS];      // old packets (numbered behind the last reading) heard late, per slot (v0.12.2)
+  uint32_t stale;                // the same, since the hub started
+  uint32_t linkedAt;             // when this hub last wrote its key to the node (v0.12.2)
   bool local;                    // the hub's own sensors (v0.12)
 };
 
@@ -358,6 +370,8 @@ static const char *espResetText(esp_reset_reason_t r) {
 
 // ---------------- helpers ----------------
 static int clampPct(long p) { return p < 0 ? 0 : (p > 100 ? 100 : (int)p); }
+// Milliseconds since "at", never negative: "at" can be a moment later than a "now" taken just before (v0.12.2).
+static uint32_t sinceMs(uint32_t now, uint32_t at) { int32_t d = (int32_t)(now - at); return d > 0 ? (uint32_t)d : 0; }
 
 static int pctOf(const Sensor &s, uint16_t raw) {
   if (s.dry == s.wet) return 0;
@@ -463,6 +477,14 @@ static void handlePacket(const char *mac, int rssi, uint8_t addrType, bool conne
     if (rssi < n.rssiMin) n.rssiMin = (int8_t)rssi;
     if (rssi > n.rssiMax) n.rssiMax = (int8_t)rssi;
     bool fresh = !p.hasPid || !n.havePid || p.pid != n.lastPid;
+    // An old copy heard late (numbered 1 to 16 behind the last reading, within 20 s of it) is not a new reading:
+    // counting it would add a reading, a gap and a sub-second timing sample (v0.12.2). A restart starts again at
+    // 1 or 2, so those are left alone and still caught below; and a restart whose first readings were missed
+    // comes a minute or more later, so the time limit keeps it a reading.
+    if (fresh && p.hasPid && n.havePid && p.pid > 2 && n.lastFreshAt && nowMs - n.lastFreshAt < 20000) {
+      uint8_t back = (uint8_t)(n.lastPid - p.pid);
+      if (back >= 1 && back <= 16) { fresh = false; n.stale++; n.hStale[hSlot]++; }
+    }
     if (!fresh && !local && connectable && n.lastFreshAt && nowMs - n.lastFreshAt > 8000 &&
         (!n.windowAt || nowMs - n.windowAt > 600000)) {
       // Still advertising 8 s after its reading, when a burst lasts 6 s: the node is in its 10-minute link
@@ -592,7 +614,7 @@ static void pushDay() {
 static void rotateHealthSlot() {
   xSemaphoreTake(lock, portMAX_DELAY);
   hSlot = (hSlot + 1) % H_SLOTS;
-  for (int i = 0; i < MAX_NODES; i++) { Node &n = nodes[i]; n.hRx[hSlot] = n.hLost[hSlot] = n.hAdv[hSlot] = 0; n.hRssi[hSlot] = 0; }
+  for (int i = 0; i < MAX_NODES; i++) { Node &n = nodes[i]; n.hRx[hSlot] = n.hLost[hSlot] = n.hAdv[hSlot] = n.hStale[hSlot] = 0; n.hRssi[hSlot] = 0; }
   if (hSlots < H_SLOTS) hSlots++;
   hSlotAt = millis();
   xSemaphoreGive(lock);
@@ -759,8 +781,8 @@ static void handleRoot() {
 static void handleLive() {
   String j;
   j.reserve(3000);
-  uint32_t now = millis();
   xSemaphoreTake(lock, portMAX_DELAY);
+  uint32_t now = millis();                          // after the lock: no packet can be newer than "now"
   j += "{\"uptime\":"; j += now / 1000;
   j += ",\"fw\":\""; j += FW_VERSION; j += '"';
   j += ",\"trial\":"; j += trialActive ? "true" : "false";
@@ -801,7 +823,7 @@ static void handleLive() {
     j += ",\"lux\":"; j += String(nd.lux, 0);
     j += ",\"uv\":"; j += (nd.hasUV && now - nd.uvAt < 5 * STALE_MS) ? String(nd.uv, 1) : String("null");
     j += ",\"brssi\":"; j += nd.rssi;
-    j += ",\"ageS\":"; j += (now - nd.lastSeen) / 1000;
+    j += ",\"ageS\":"; j += sinceMs(now, nd.lastSeen) / 1000;
     j += ",\"loss\":"; j += tot ? String(100.0f * nd.lost / tot, 1) : String("0");
     j += ",\"wired\":"; j += nd.local ? "true" : "false";
     j += ",\"nfw\":\""; j += nd.fw;
@@ -1158,7 +1180,7 @@ static void handleSetupPage(const String &msg, bool isErr) {
 #if HUB_I2C_SENSORS
   chk("s_i2c", LS_I2C, "I2C sensors on D4/D5 (SHT40 or AHT20, LTR390; found automatically)");
 #endif
-  b += "<div class=note>The hub reads these like a node, every 30 s, and shows them as one more pot. Leave all unticked for a hub without sensors.</div>";
+  b += "<div class=note>The hub reads these like a node, every 60 s, and shows them as one more pot. Leave all unticked for a hub without sensors.</div>";
   b += "<button>Save and restart</button></form>";
   sendPage(isErr ? 400 : 200, b);
 }
@@ -1399,15 +1421,20 @@ static uint32_t nodeFailed(int i, const char *why) {
   return mins * 60000UL;
 }
 
+static char authWhy[48] = "";                     // why the last proof failed (v0.12.2), for the status and log
 static bool nodeAuth(BLERemoteService *gw) {       // prove the link key: HMAC over the node's fresh nonce
   BLERemoteCharacteristic *cn = gw->getCharacteristic(BLEUUID(GW_NONCE)), *ca = gw->getCharacteristic(BLEUUID(GW_AUTH));
-  if (!cn || !ca) return false;
+  if (!cn || !ca) { strlcpy(authWhy, "failed: no link service", sizeof authWhy); return false; }
   String n = cn->readValue();
   const uint8_t *raw = cn->readRawData();
-  if (n.length() != 16 || !raw) return false;
+  if (n.length() != 16 || !raw) { strlcpy(authWhy, "failed: couldn't read its nonce", sizeof authWhy); return false; }
   uint8_t tag[32];
   gw_hmac_sha256(nodeKey, sizeof nodeKey, raw, 16, tag);
-  return ca->writeValue(tag, 16, true);
+  uint32_t t0 = millis();
+  bool ok = ca->writeValue(tag, 16, true);
+  uint32_t dt = millis() - t0;
+  if (!ok) snprintf(authWhy, sizeof authWhy, dt > 20000 ? "got no reply in %.0f s" : "was refused in %.1f s", dt / 1000.0f);
+  return ok;
 }
 
 // The bootloader is running (just handed over, or stuck after a failed try): send it the firmware.
@@ -1482,17 +1509,40 @@ static uint32_t nodeCheck(int i, const char *mac, uint8_t type, float volt, bool
   strlcpy(nodes[i].fw, ver.length() ? ver.c_str() : "?", sizeof nodes[i].fw);
   xSemaphoreGive(lock);
 
-  if (gw && !(linked && nodeAuth(gw))) {
-    if (window) {                                  // the node was just reset: link it to this hub
+  if (gw) {
+    // In its window (10 min after a reset) the node takes a key without proof. Write ours first, then prove it
+    // (v0.12.2): before, the hub first tried to prove the key the node held, another hub's, and the key write after
+    // that refused proof failed every time. Not written again within 15 min of a link, so the next check proves
+    // the key and moves on to the update.
+    bool wrote = false;
+    if (window && !(nodes[i].linkedAt && millis() - nodes[i].linkedAt < 15UL * 60 * 1000)) {
       BLERemoteCharacteristic *ck = gw->getCharacteristic(BLEUUID(GW_KEY));
-      bool ok = ck && ck->writeValue(nodeKey, sizeof nodeKey, true);
-      nodeDisconnect();
-      nodeStatus(i, ok ? "linked to this hub" : "linking failed");
-      return ok ? 40000 : 120000;
+      uint32_t t0 = millis();
+      wrote = ck && ck->writeValue(nodeKey, sizeof nodeKey, true);
+      uint32_t dt = millis() - t0;
+      if (!wrote) {
+        bool still = nodeClient->isConnected();
+        nodeDisconnect();
+        if (!ck) nodeStatus(i, "linking failed: no key characteristic");
+        else nodeStatus(i, dt > 20000 ? "linking failed: key write got no reply in %.0f s%s" : "linking failed: key write refused (%.1f s)%s",
+                        dt / 1000.0f, still ? "" : ", disconnected");
+        return 120000;
+      }
     }
-    nodeDisconnect();
-    nodeStatus(i, linked ? "linked to another hub: press its reset button" : "not linked: press its reset button");
-    return 3600000;
+    bool proven = (linked || wrote) && nodeAuth(gw);
+    if (!proven) {
+      nodeDisconnect();
+      if (wrote) nodeStatus(i, "linking failed: key written, but its proof %s", authWhy);
+      else if (linked) nodeStatus(i, "linked to another hub (proof %s): press its reset button", authWhy);
+      else nodeStatus(i, "not linked: press its reset button");
+      return wrote ? 120000 : 3600000;
+    }
+    if (wrote) {                                   // linked: update on a later connection, once the node has saved the key
+      nodes[i].linkedAt = millis() | 1;
+      nodeDisconnect();
+      nodeStatus(i, "linked to this hub");
+      return 40000;
+    }
   }
   if (!NODE_FW_BUNDLED || dfuVersionCompare(NODE_FW_VERSION, ver.c_str()) <= 0) {
     nodeDisconnect();
@@ -1568,10 +1618,10 @@ static void nodeUpdaterLoop() {
   for (int i = 0; i < MAX_NODES && pick < 0; i++) {
     Node &n = nodes[i];
     if (!n.used) continue;
-    if (n.rescueAt && (int32_t)(now - n.rescueAt) >= 0 && now - n.lastSeen > 60000) {
+    if (n.rescueAt && (int32_t)(now - n.rescueAt) >= 0 && sinceMs(now, n.lastSeen) > 60000) {
       if (n.fails >= 4) { n.rescueAt = 0; strlcpy(n.st, "stuck in its bootloader: flash it over USB", sizeof n.st); continue; }
       pick = i; rescue = true;
-    } else if (n.connectable && now - n.lastSeen < 2500 && (!n.nextCheckAt || (int32_t)(now - n.nextCheckAt) >= 0)) {
+    } else if (n.connectable && sinceMs(now, n.lastSeen) < 2500 && (!n.nextCheckAt || (int32_t)(now - n.nextCheckAt) >= 0)) {
       pick = i;
     }
   }
@@ -1602,7 +1652,7 @@ static void jsonKV(String &j, const char *k, const char *v) { j += '"'; j += k; 
 static void jsonKV(String &j, const char *k, long v) { j += '"'; j += k; j += "\":"; j += v; j += ','; }
 static void jsonKB(String &j, const char *k, bool v) { j += '"'; j += k; j += "\":"; j += v ? "true" : "false"; j += ','; }
 static void jsonEnd(String &j, char close) { if (j.endsWith(",")) j.remove(j.length() - 1); j += close; }
-static long ageS(uint32_t now, uint32_t at) { return at ? (long)((now - at) / 1000) : -1L; }
+static long ageS(uint32_t now, uint32_t at) { return at ? (long)(sinceMs(now, at) / 1000) : -1L; }
 
 static String activityNow() {
   if (otaBusy) return "Receiving a hub firmware update";
@@ -1734,6 +1784,7 @@ static void handleDiagApi() {
   jsonKV(j, "oldestS", (qCount && epoch > 1700000000) ? (long)(epoch - queue_[qHead].ts) : (qCount ? -2L : -1L));
   jsonEnd(j, '}'); j += ',';
   xSemaphoreTake(lock, portMAX_DELAY);
+  now = millis();                                   // after the lock: no packet can be newer than "now" (v0.12.2)
   j += "\"nodes\":[";
   for (int i = 0; i < MAX_NODES; i++) {
     Node &n = nodes[i];
@@ -1746,7 +1797,7 @@ static void handleDiagApi() {
     jsonKV(j, "mac", n.mac);
     jsonKV(j, "type", n.local ? "wired to this hub" : n.addrType == 1 ? "random" : n.addrType == 0 ? "public" : "other");
     jsonKV(j, "probes", probes.c_str());
-    jsonKB(j, "online", now - n.lastSeen < STALE_MS);
+    jsonKB(j, "online", sinceMs(now, n.lastSeen) < STALE_MS);
     jsonKV(j, "seenS", ageS(now, n.lastSeen));
     jsonKV(j, "freshS", ageS(now, n.lastFreshAt));
     jsonKV(j, "firstS", ageS(now, n.firstSeen));
@@ -1792,6 +1843,10 @@ static void handleDiagApi() {
     jsonKV(j, "airS", n.hasAir ? ageS(now, n.airAt) : -1L);
     jsonKV(j, "luxS", n.hasLux ? ageS(now, n.luxAt) : -1L);
     jsonKV(j, "windowS", ageS(now, n.windowAt));
+    long hst = 0;
+    for (int k = 0; k < H_SLOTS; k++) hst += n.hStale[k];
+    jsonKV(j, "hStale", hst); jsonKV(j, "stale", (long)n.stale);
+    jsonKV(j, "linkS", ageS(now, n.linkedAt));
     jsonEnd(j, '}'); j += ',';
   }
   jsonEnd(j, ']'); j += ',';
@@ -2040,7 +2095,7 @@ void loop() {
     char went[MAX_NODES][18]; bool up[MAX_NODES]; int nw = 0;
     xSemaphoreTake(lock, portMAX_DELAY);
     for (int i = 0; i < MAX_NODES; i++) if (nodes[i].used && nodes[i].firstSeen) {
-      bool on = now - nodes[i].lastSeen < STALE_MS;
+      bool on = sinceMs(millis(), nodes[i].lastSeen) < STALE_MS;   // millis() under the lock (v0.12.2)
       if (on != nodes[i].online) { nodes[i].online = on; strlcpy(went[nw], nodes[i].mac, 18); up[nw++] = on; }
     }
     xSemaphoreGive(lock);
