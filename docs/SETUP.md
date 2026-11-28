@@ -10,7 +10,13 @@
   LTR390 / VEML7700 / GL5539 light, LTR390 UV                                                air + light history, once a minute
 ```
 
-**Versions:** node firmware v0.13.2 (XIAO and the Nano ESP32 test node), hub firmware v0.13.2 (the hub updates its nodes for you, section 6; diagnostics and health checks, section 5; sensors on the hub, section 4b), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
+**Versions:** node firmware v0.13.3 (XIAO and the Nano ESP32 test node), hub firmware v0.13.3 (the hub updates its nodes for you, section 6; diagnostics and health checks, section 5; sensors on the hub, section 4b), cloud v0.9 (one new column, added automatically on first use; no migration step). The node reads light from the GL5539 photoresistor by default; set `LIGHT_SENSOR` to `LIGHT_I2C` in the node sketch for I2C sensors (section 1b).
+
+**New in v0.13.3 (hub): over-the-air transfers**
+- **Linking works** (confirmed on a node, 2026-11-27): "linked to this hub", then "up to date".
+- **20-byte packets from the start.** On the first real over-the-air try, the XIAO's bootloader gave no receipt for 244-byte packets.
+- **The restart after a failed try now reaches the bootloader.** It went out as a write without response, which the bootloader's control point drops, so the bootloader stayed mid-update and answered every later start with "wrong state" until the hub gave up ("stuck in its bootloader"). It's now a write with response, and a bootloader still in that state is restarted and the update begun again.
+- **Node 0.13.3 changes only its version,** so a linked node has something newer to receive: the first full over-the-air test.
 
 **New in v0.13.2 (node and hub): the second link bug**
 - **"key written, but its proof was refused".** With the reply fixed in v0.13.1, the next step failed. The node's Bluetooth library (Bluefruit) runs a write-authorize callback later by default, and hands it a copy of the write that stops after the first data byte. So the node saved a link key that was all but one byte garbage, and checked every proof against garbage. The node now runs those callbacks on the Bluetooth event itself, with the whole 16 bytes.

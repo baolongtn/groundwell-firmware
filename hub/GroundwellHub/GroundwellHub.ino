@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL hub v0.13.2
+  GROUNDWELL hub v0.13.3
   Board: Seeed XIAO ESP32-C6, Arduino core "esp32 by Espressif Systems" 3.x (NOT 4.x: it replaced the BLE API),
          board "XIAO_ESP32C6", Tools > Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)".
          The menu only sets the IDE's size check: partitions.csv in this folder replaces the layout with two
@@ -82,6 +82,11 @@
     - v0.13.2 carries node 0.13.2, which reads the whole key and proof (the cause of "proof was refused"). A node
       that can't complete a link but is in its window (just reset) and on older firmware is updated anyway, the
       way a phone would: the node allows that in its window. It links after it restarts on the new firmware.
+    - v0.13.3, node transfers (from the first real over-the-air attempt, 2026-11-27): 20-byte packets from the
+      start (the XIAO's bootloader gave no receipt for 244-byte ones). After a failed try the hub's restart
+      command now reaches the bootloader: it went out as a write without response, which the bootloader's
+      control point drops, so the bootloader stayed mid-update and refused every later start ("wrong state").
+      A bootloader still in that state is restarted and the update begun again.
     - Probe names and calibration set on the cloud dashboard (Admin > Calibrate) come back in the
       upload reply and are applied and saved here, as if set on this page (v0.6.2).
 
@@ -146,9 +151,9 @@
   #define GW_CRASH_TEST 0      // 1 = rollback test build: crashes 20 s after every boot (the GitHub build makes one)
 #endif
 #if GW_CRASH_TEST
-  #define GW_FW_VERSION "0.13.2-crashtest"
+  #define GW_FW_VERSION "0.13.3-crashtest"
 #else
-  #define GW_FW_VERSION "0.13.2"
+  #define GW_FW_VERSION "0.13.3"
 #endif
 static const char *FW_VERSION = GW_FW_VERSION;
 // Optional secrets.h (git-ignored): WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY and optionally OTA_PASS.
@@ -1387,6 +1392,9 @@ struct BleDfuLink : DfuLink {
   }
   void drain() override { xQueueReset(notifQ); }
   void progress(uint32_t done, uint32_t total) override { nodes[node].pct = (uint8_t)(done * 100ULL / total); }
+  const char *mac = nullptr;
+  uint8_t type = 0;
+  bool restart() override;                       // defined after nodeConnect()
 };
 
 static void nodeStatus(int i, const char *fmt, ...) {
@@ -1417,6 +1425,28 @@ static bool nodeConnect(const char *mac, uint8_t type, bool plusOne, uint32_t ms
 static void nodeDisconnect() {
   if (nodeClient->isConnected()) nodeClient->disconnect();
   for (uint32_t t = millis(); nodeClient->isConnected() && millis() - t < 3000;) delay(20);
+}
+
+// Restart a bootloader stuck mid-update and connect to it again (v0.13.3). The restart command must be a write
+// with response: the control point drops writes without one. The bootloader restarts at once, so no reply comes.
+// If the node's own firmware is still valid it comes back instead of the bootloader: hand it back to nodeCheck.
+bool BleDfuLink::restart() {
+  uint8_t r = DFU_OP_RESET;
+  if (nodeClient->isConnected() && ctrl) ctrl->writeValue(&r, 1, true);
+  nodeDisconnect();
+  delay(3000);
+  bool up = false;
+  for (int a = 0; a < 6 && !up; a++) up = nodeConnect(mac, type, a & 1, 4000);
+  if (!up) return false;
+  if (nodeClient->getService(BLEUUID(GW_SVC))) { nodeDisconnect(); return false; }   // its firmware, not the bootloader
+  BLERemoteService *dfu = nodeClient->getService(BLEUUID(DFU_SVC));
+  ctrl = dfu ? dfu->getCharacteristic(BLEUUID(DFU_CTRL)) : nullptr;
+  pkt  = dfu ? dfu->getCharacteristic(BLEUUID(DFU_PKT)) : nullptr;
+  if (!ctrl || !pkt) return false;
+  xQueueReset(notifQ);
+  ctrl->registerForNotify(onDfuNotify);
+  logEvent("Node %s: its bootloader was left mid-update: restarted it", mac + 9);
+  return true;
 }
 
 static uint32_t nodeFailed(int i, const char *why) {
@@ -1451,22 +1481,27 @@ static uint32_t nodeTransfer(int i, const char *mac, uint8_t type, bool small) {
   BLERemoteService *dfu = nodeClient->getService(BLEUUID(DFU_SVC));
   BleDfuLink link;
   link.node = i;
+  link.mac = mac;
+  link.type = type;
   link.ctrl = dfu ? dfu->getCharacteristic(BLEUUID(DFU_CTRL)) : nullptr;
   link.pkt  = dfu ? dfu->getCharacteristic(BLEUUID(DFU_PKT)) : nullptr;
   if (!link.ctrl || !link.pkt) { nodeDisconnect(); nodes[i].rescueAt = (millis() + 90000) | 1; return nodeFailed(i, "no update service in its bootloader"); }
   xQueueReset(notifQ);
   link.ctrl->registerForNotify(onDfuNotify);
   uint16_t mtu = nodeClient->getMTU();
-  uint16_t pkt = (small || mtu <= 23) ? 20 : (uint16_t)((mtu - 3 > 244 ? 244 : mtu - 3) & ~3);
+  // 20-byte packets (v0.13.3): the XIAO's bootloader gave no receipt at all for 244-byte packets, and a failed
+  // first try costs the node its window. Larger packets stay possible for a bootloader known to take them.
+  (void)small;
+  uint16_t pkt = 20;
   logEvent("Node %s: sending %lu bytes in %u-byte packets (MTU %u)", mac + 9, (unsigned long)NODE_FW_LEN, pkt, mtu);
   uint32_t t0 = millis();
   char err[96];
   const char *e = dfuTransfer(link, NODE_FW_BIN, NODE_FW_LEN, NODE_FW_DAT, NODE_FW_DAT_LEN, pkt, 8, err, sizeof err);
   if (e) {
-    uint8_t r = DFU_OP_RESET;
-    if (nodeClient->isConnected()) link.ctrl->writeValue(&r, 1, false);   // bootloader restarts: back to the old firmware
+    uint8_t r = DFU_OP_RESET;                     // with response (v0.13.3): the control point drops writes without one
+    if (nodeClient->isConnected() && link.ctrl) link.ctrl->writeValue(&r, 1, true);   // restarts: old firmware if still valid
     nodeDisconnect();
-    if (pkt > 20) nodes[i].smallPkts = true;      // an older bootloader only takes 20-byte packets: use those next time
+    nodes[i].smallPkts = true;
     nodes[i].rescueAt = (millis() + 90000) | 1;
     return nodeFailed(i, e);
   }

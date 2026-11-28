@@ -21,6 +21,8 @@ struct SimBootloader : DfuLink {
   uint32_t maxApp = 400000;
   int dropReceiptNo = -1;         // drop this receipt (0-based), as if the notification were lost
   bool lateReceiptAtEnd = true;   // also send a receipt when the last packet completes a group
+  bool canRestart = true;         // restart() works (the hub reconnects to a fresh bootloader)
+  int restarts = 0;
   // state
   enum { IDLE, START, INIT, READY, RECV, DONE } st = IDLE;
   std::deque<std::vector<uint8_t>> q;
@@ -51,6 +53,7 @@ struct SimBootloader : DfuLink {
         return true;
       }
       case DFU_OP_ACTIVATE: activated = validated; return true;
+      case DFU_OP_RESET: st = IDLE; q.clear(); return true;
       default: return true;
     }
   }
@@ -87,6 +90,7 @@ struct SimBootloader : DfuLink {
     n = q.front().size(); memcpy(out, q.front().data(), n); q.pop_front(); return true;
   }
   void drain() override { q.clear(); }
+  bool restart() override { if (!canRestart) return false; st = IDLE; q.clear(); prn = cnt = 0; restarts++; return true; }
   void progress(uint32_t done, uint32_t) override { lastProgress = done; }
 };
 
@@ -128,8 +132,17 @@ int main() {
   { auto img2 = makeImage(20 * 8 * 50), dat2 = makeDat(img2); SimBootloader b; b.lateReceiptAtEnd = false;
     const char *e = dfuTransfer(b, img2.data(), img2.size(), dat2.data(), dat2.size(), 20, 8, err, sizeof err);
     check(!e && b.activated, "same, with a bootloader that sends no receipt at the end", e); }
-  { SimBootloader b; b.st = SimBootloader::RECV; const char *e = dfuTransfer(b, img.data(), img.size(), dat.data(), dat.size(), 20, 8, err, sizeof err);
-    check(e && !b.activated && strstr(e, "wrong state"), "a bootloader stuck mid-update answers 'wrong state'", e); }
+  { SimBootloader b; b.st = SimBootloader::RECV; b.canRestart = false;
+    const char *e = dfuTransfer(b, img.data(), img.size(), dat.data(), dat.size(), 20, 8, err, sizeof err);
+    check(e && !b.activated && strstr(e, "wrong state"), "a bootloader stuck mid-update that can't be restarted: 'wrong state'", e); }
+  { SimBootloader b; b.st = SimBootloader::RECV;           // v0.13.3: restart it, then the update goes through
+    const char *e = dfuTransfer(b, img.data(), img.size(), dat.data(), dat.size(), 20, 8, err, sizeof err);
+    check(!e && b.activated && b.img == img && b.restarts == 1, "a bootloader stuck mid-update is restarted once, then updated", e); }
+  { SimBootloader b; b.maxPkt = 20;                         // the 2026-11-27 sequence: 244-byte try, then 20-byte retry
+    const char *e1 = dfuTransfer(b, img.data(), img.size(), dat.data(), dat.size(), 244, 8, err, sizeof err);
+    bool failed = e1 && !b.activated;
+    const char *e2 = dfuTransfer(b, img.data(), img.size(), dat.data(), dat.size(), 20, 8, err, sizeof err);
+    check(failed && !e2 && b.activated && b.img == img && b.restarts == 1, "failed 244-byte try, then a 20-byte retry restarts the bootloader and succeeds", e2); }
 
   struct { const char *a, *b; int want; } v[] = {{"0.10.0", "0.9.1", 1}, {"0.9.1", "0.10.0", -1}, {"0.10.0", "0.10.0", 0},
     {"1.0", "0.99.99", 1}, {"0.10.0", "0.10", 0}, {"0.9.1-crashtest", "0.9.1", 0}, {"0.10.1", "0.10.0", 1}, {"", "0.9.1", -1}};

@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL sensor node v0.13.2  (capacitive soil probe + air temperature/humidity + light + UV, one board)
+  GROUNDWELL sensor node v0.13.3  (capacitive soil probe + air temperature/humidity + light + UV, one board)
   Board:  Seeed XIAO nRF52840 (plain or Sense)
           Arduino IDE: Boards Manager URL
             https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
@@ -32,6 +32,8 @@
   callback task, by default, and hands it a copy of the write that stops after the first data byte. So the node
   saved a key that was all but one byte garbage, and checked every proof against garbage: "proof was refused".
   The link callbacks now run at once, on the Bluetooth event itself, with the full data.
+  v0.13.3: no change on the node; the version moves with the hub's transfer fixes, so a linked node has a newer
+  firmware to receive over the air (the first end-to-end test of the hub's updates).
   Diagnostics (v0.11): a read-only characteristic reports uptime, why it last restarted, readings sent,
   air-sensor read failures, sensors, calibration, link, update window, radio power, interval, connections
   and failed link-key attempts. The hub reads it at each check and shows it on http://plants.local/diag.
@@ -125,7 +127,7 @@
       I2C sensors  (LIGHT_I2C) SDA -> A4, SCL -> A5
 */
 
-static const char *FW_VERSION = "0.13.2";
+static const char *FW_VERSION = "0.13.3";
 
 // ---------------- light sensor choice ----------------
 #define LIGHT_LDR      1                         // GL5539 photoresistor + DHT11, no I2C (the parts in hand)
