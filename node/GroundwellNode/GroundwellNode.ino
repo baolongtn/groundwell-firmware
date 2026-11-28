@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL sensor node v0.13.0  (capacitive soil probe + air temperature/humidity + light + UV, one board)
+  GROUNDWELL sensor node v0.13.1  (capacitive soil probe + air temperature/humidity + light + UV, one board)
   Board:  Seeed XIAO nRF52840 (plain or Sense)
           Arduino IDE: Boards Manager URL
             https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
@@ -24,6 +24,10 @@
   its 100 to 150 uA standby current only flows for about 3 s a minute: move its VCC wire to D3. Left on 3V3 it
   works as before. FAST now takes effect within 5 s. New serial command SETTLE shows how long the capacitive
   probe takes to settle after power-up.
+  v0.13.1: fixes linking, and every write over Bluetooth that the node accepts. Its reply to an accepted write
+  left out the written data, which the SoftDevice requires, so the reply was never sent and the hub waited 30 s:
+  "key write got no reply in 30 s". Refusals were answered, which is why only a link that should succeed failed.
+  A reply the SoftDevice rejects now counts in the node's self-report (rwerr).
   Diagnostics (v0.11): a read-only characteristic reports uptime, why it last restarted, readings sent,
   air-sensor read failures, sensors, calibration, link, update window, radio power, interval, connections
   and failed link-key attempts. The hub reads it at each check and shows it on http://plants.local/diag.
@@ -117,7 +121,7 @@
       I2C sensors  (LIGHT_I2C) SDA -> A4, SCL -> A5
 */
 
-static const char *FW_VERSION = "0.13.0";
+static const char *FW_VERSION = "0.13.1";
 
 // ---------------- light sensor choice ----------------
 #define LIGHT_LDR      1                         // GL5539 photoresistor + DHT11, no I2C (the parts in hand)
@@ -919,10 +923,11 @@ static void updateDiag() {
   char b[160];
   uint32_t winLeft = dfuWindowOpen() ? (DFU_WINDOW_MS - millis()) / 1000 : 0;
   bool fast = fastUntil && (int32_t)(fastUntil - millis()) > 0;
-  snprintf(b, sizeof b, "up=%lu;rst=%s;n=%lu;air=%s;airfail=%lu;light=%s;cal=%d;link=%d;win=%lu;tx=%d;ivl=%lu;con=%lu;authfail=%lu",
+  snprintf(b, sizeof b, "up=%lu;rst=%s;n=%lu;air=%s;airfail=%lu;light=%s;cal=%d;link=%d;win=%lu;tx=%d;ivl=%lu;con=%lu;authfail=%lu;rwerr=%lu",
            (unsigned long)(millis() / 1000), resetReasonText(), (unsigned long)readings, airSrc, (unsigned long)airFails, lightName(),
            calOk ? 1 : 0, keyOk ? 1 : 0, (unsigned long)winLeft, (int)TX_POWER_DBM,
-           (unsigned long)((fast ? FAST_REPORT_MS : REPORT_MS) / 1000), (unsigned long)connects, (unsigned long)authFails);
+           (unsigned long)((fast ? FAST_REPORT_MS : REPORT_MS) / 1000), (unsigned long)connects, (unsigned long)authFails,
+           (unsigned long)replyErrs);
   gwDiag.write(b);
 }
 
@@ -936,10 +941,20 @@ static bool plainWrite(ble_gatts_evt_write_t *r) {
   return r->op != BLE_GATTS_OP_PREP_WRITE_REQ && r->op != BLE_GATTS_OP_EXEC_WRITE_REQ_NOW && r->op != BLE_GATTS_OP_EXEC_WRITE_REQ_CANCEL;
 }
 
-static void replyWrite(uint16_t conn, bool ok) {
+// Answer a write that waits for our authorization. An accepted write must hand its data back with update set:
+// the SoftDevice API says the bit "must always be set" for writes, and without it the call fails and no reply
+// goes out at all (v0.13.1; before, every accepted key write and key proof left the hub waiting 30 s).
+static uint32_t replyErrs = 0;
+static void replyWrite(uint16_t conn, bool ok, const ble_gatts_evt_write_t *r) {
   ble_gatts_rw_authorize_reply_params_t reply = {.type = BLE_GATTS_AUTHORIZE_TYPE_WRITE};
   reply.params.write.gatt_status = ok ? BLE_GATT_STATUS_SUCCESS : BLE_GATT_STATUS_ATTERR_INSUF_AUTHORIZATION;
-  sd_ble_gatts_rw_authorize_reply(conn, &reply);
+  if (ok) {
+    reply.params.write.update = 1;
+    reply.params.write.offset = r->offset;
+    reply.params.write.len    = r->len;
+    reply.params.write.p_data = r->data;
+  }
+  if (sd_ble_gatts_rw_authorize_reply(conn, &reply) != NRF_SUCCESS) replyErrs++;
 }
 
 static void authWriteCb(uint16_t conn, BLECharacteristic *, ble_gatts_evt_write_t *r) {
@@ -949,7 +964,7 @@ static void authWriteCb(uint16_t conn, BLECharacteristic *, ble_gatts_evt_write_
     gw_hmac_sha256(linkKey, 16, nonce, 16, mac);
     ok = gw_equal(mac, r->data, 16);
   }
-  replyWrite(conn, ok);
+  replyWrite(conn, ok, r);
   if (ok) authed = true; else authFails++;
   newNonce();                                        // one guess per nonce
 }
@@ -962,7 +977,7 @@ static void keyWriteCb(uint16_t conn, BLECharacteristic *, ble_gatts_evt_write_t
     keyDirty = true;                                 // saved to flash by the main loop, woken right away
     xSemaphoreGive(wakeSem);
   }
-  replyWrite(conn, ok);
+  replyWrite(conn, ok, r);
   updateInfo();
 }
 
@@ -1006,7 +1021,11 @@ static void dfuCtrlCb(uint16_t conn_hdl, BLECharacteristic *chr, ble_gatts_evt_w
     return;
   }
   reply.params.write.gatt_status = BLE_GATT_STATUS_SUCCESS;
-  sd_ble_gatts_rw_authorize_reply(conn_hdl, &reply);
+  reply.params.write.update = 1;                     // an accepted write must hand its data back (v0.13.1)
+  reply.params.write.offset = request->offset;
+  reply.params.write.len    = request->len;
+  reply.params.write.p_data = request->data;
+  if (sd_ble_gatts_rw_authorize_reply(conn_hdl, &reply) != NRF_SUCCESS) replyErrs++;
   if (request->data[0] != 1) return;                 // 1 = START DFU
 
   // Hand the connection data to the bootloader (at 0x20007F80) so it keeps the same address and the client

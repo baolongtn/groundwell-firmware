@@ -1,5 +1,5 @@
 /*
-  GROUNDWELL hub v0.13.0
+  GROUNDWELL hub v0.13.1
   Board: Seeed XIAO ESP32-C6, Arduino core "esp32 by Espressif Systems" 3.x (NOT 4.x: it replaced the BLE API),
          board "XIAO_ESP32C6", Tools > Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)".
          The menu only sets the IDE's size check: partitions.csv in this folder replaces the layout with two
@@ -77,6 +77,8 @@
       longer counts as a reading, a gap or a timing sample.
     - Ages and online state are worked out with the node table locked, so a packet arriving meanwhile can't make a
       node look offline "for 50 days".
+    - v0.13.1 carries node 0.13.1, which answers the writes it accepts (the real cause of "key write got no
+      reply"). A link step that loses the connection now says so instead of "refused".
     - Probe names and calibration set on the cloud dashboard (Admin > Calibrate) come back in the
       upload reply and are applied and saved here, as if set on this page (v0.6.2).
 
@@ -141,9 +143,9 @@
   #define GW_CRASH_TEST 0      // 1 = rollback test build: crashes 20 s after every boot (the GitHub build makes one)
 #endif
 #if GW_CRASH_TEST
-  #define GW_FW_VERSION "0.13.0-crashtest"
+  #define GW_FW_VERSION "0.13.1-crashtest"
 #else
-  #define GW_FW_VERSION "0.13.0"
+  #define GW_FW_VERSION "0.13.1"
 #endif
 static const char *FW_VERSION = GW_FW_VERSION;
 // Optional secrets.h (git-ignored): WIFI_SSID, WIFI_PASS, CLOUD_URL, INGEST_KEY and optionally OTA_PASS.
@@ -1433,7 +1435,8 @@ static bool nodeAuth(BLERemoteService *gw) {       // prove the link key: HMAC o
   uint32_t t0 = millis();
   bool ok = ca->writeValue(tag, 16, true);
   uint32_t dt = millis() - t0;
-  if (!ok) snprintf(authWhy, sizeof authWhy, dt > 20000 ? "got no reply in %.0f s" : "was refused in %.1f s", dt / 1000.0f);
+  if (!ok) snprintf(authWhy, sizeof authWhy, !nodeClient->isConnected() ? "lost the connection after %.1f s"
+                                            : dt > 20000 ? "got no reply in %.0f s" : "was refused in %.1f s", dt / 1000.0f);
   return ok;
 }
 
@@ -1524,8 +1527,8 @@ static uint32_t nodeCheck(int i, const char *mac, uint8_t type, float volt, bool
         bool still = nodeClient->isConnected();
         nodeDisconnect();
         if (!ck) nodeStatus(i, "linking failed: no key characteristic");
-        else nodeStatus(i, dt > 20000 ? "linking failed: key write got no reply in %.0f s%s" : "linking failed: key write refused (%.1f s)%s",
-                        dt / 1000.0f, still ? "" : ", disconnected");
+        else if (!still) nodeStatus(i, "linking failed: connection dropped during the key write (%.1f s): move it closer", dt / 1000.0f);
+        else nodeStatus(i, dt > 20000 ? "linking failed: key write got no reply in %.0f s" : "linking failed: key write refused (%.1f s)", dt / 1000.0f);
         return 120000;
       }
     }
